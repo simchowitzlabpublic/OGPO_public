@@ -103,7 +103,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== DSRL+EXPO Kitchen | seed=$seed ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=dsrl_plus_expo \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

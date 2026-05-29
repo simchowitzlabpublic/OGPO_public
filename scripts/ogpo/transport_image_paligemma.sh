@@ -211,7 +211,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== OGPO Square PaliGemma | seed=$seed | encoder=$vit_encoder | model=$restore_encoder_path ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=ogpo \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

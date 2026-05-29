@@ -97,7 +97,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== BPTT Transport | seed=$seed ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=bptt \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

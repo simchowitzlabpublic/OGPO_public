@@ -147,7 +147,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== EXPO Adroit | seed=$seed ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=expo \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

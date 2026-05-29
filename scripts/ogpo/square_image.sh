@@ -167,7 +167,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== OGPO Square Image | seed=$seed | actor_obs=$actor_obs | critic_obs=$critic_obs ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=ogpo \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

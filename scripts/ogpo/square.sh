@@ -193,7 +193,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== OGPO Square | seed=$seed ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=ogpo \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

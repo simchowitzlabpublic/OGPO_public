@@ -204,7 +204,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== OGPO Transport V-ablation | seed=$seed | use_value_fn=$use_value_fn v_training_mode=$v_training_mode adv_baseline=$adv_baseline q_vr=$q_variance_reduction ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=ogpo \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

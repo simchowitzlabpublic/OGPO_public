@@ -376,6 +376,14 @@ def setup_experiment_logging(
     else:
         exp_name = wandb_name + "seed" + str(seed)
 
+    # Relocate experiment data (flags.json, CSV logs) with the `OGPO_EXP_ROOT`
+    # environment variable (e.g. point it at fast scratch storage on a cluster).
+    # It replaces the root of `save_dir` while keeping the per-algo subdir, so
+    # `exp/ogpo` -> `$OGPO_EXP_ROOT/ogpo`.
+    exp_root = os.environ.get("OGPO_EXP_ROOT")
+    if exp_root:
+        save_dir = os.path.join(exp_root, os.path.basename(save_dir.rstrip("/")))
+
     wandb_run_id = None
 
     if log_enabled:

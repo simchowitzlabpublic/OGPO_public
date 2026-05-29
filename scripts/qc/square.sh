@@ -136,7 +136,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== QC Square | seed=$seed ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=qc \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

@@ -97,7 +97,7 @@ export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
 echo "=== DSRL Square | seed=$seed ==="
 
-python ogpo/main.py \
+uv run python ogpo/main.py \
     --algo=dsrl \
     --experiment.project=$project \
     --experiment.run_group=$run_group \

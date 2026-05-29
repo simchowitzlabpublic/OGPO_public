@@ -105,3 +105,6 @@ paper_plots/q_vs_mc_evals/
 *.npz
 diagnostics/
 plan.md
+
+exp/
+checkpoints/

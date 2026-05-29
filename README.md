@@ -25,6 +25,14 @@ uv sync --extra cuda13 --extra robomimic
 Drop `--extra robomimic` if you are not running the Robomimic environments
 (square, transport, tool_hang). `make sync` is a shortcut for the CUDA 12 line.
 
+> **Note:** We use robosuite version 1.5.x for all our experiments. Please download the datasets to a directory of your choice. 
+> Robomimic datasets are loaded from `~/.robomimic` by default. If your
+> downloaded datasets live elsewhere, point `ROBOMIMIC_DATASET_ROOT` at them
+> (the loader expects `$ROBOMIMIC_DATASET_ROOT/<task>/<dataset_type>/<file>.hdf5`):
+> ```bash
+> export ROBOMIMIC_DATASET_ROOT=/path/to/robomimic
+> ```
+
 ## Quickstart
 
 ```bash
@@ -43,9 +51,15 @@ bash scripts/fql/square.sh
 ```
 
 Runs log to Weights & Biases. Set `WANDB_API_KEY` in your environment to log
-online; without it, W&B falls back to offline mode. Outputs are written under
-`exp/` and checkpoints under `./checkpoints/` (override the latter with
-`OGPO_CHECKPOINT_ROOT`).
+online; without it, W&B falls back to offline mode. Experiment data (per-run
+`flags.json` and CSV logs) is written under `exp/` and checkpoints under
+`./checkpoints/`. Relocate either root with an environment variable — e.g. to
+point both at fast scratch storage on a cluster:
+
+```bash
+export OGPO_EXP_ROOT=/scratch/$USER/ogpo/exp          # experiment data + CSV logs
+export OGPO_CHECKPOINT_ROOT=/scratch/$USER/ogpo/ckpt  # checkpoints
+```
 
 ## Algorithms
 
