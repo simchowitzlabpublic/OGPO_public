@@ -1,0 +1,41 @@
+# =============================================================================
+# EXPO Configuration
+# =============================================================================
+# Exploration Policy Optimization
+
+_base_: common.yaml
+
+agent:
+  # Identification
+  agent_name: expo
+
+  # EXPO-specific learning rates
+  edit_lr: 3e-4
+  alpha_lr: 3e-4
+
+  # EXPO-specific parameters
+  n_action_samples: 8     # N samples for pi_OTF
+  n_edit_samples: 8       # M samples to edit
+  edit_policy_bound: 0.1  # B bound
+  edit_hidden_dims: [256, 256, 256]
+
+  # Flow timestep encoding
+  time_embedding: sinusoidal  # scalar | sinusoidal
+  time_embedding_dim: 32
+
+  # Flow steps (EXPO uses fewer)
+  flow_steps: 3
+  ft_flow_steps: 3
+  constant_noise_std: 0.01
+  clip_intermediate_actions: true
+
+  # BC regularization (EXPO+ features)
+  use_bc_regularization: false
+  bc_coeff: 0.1
+
+  # Critic ensemble
+  q_agg: subsample             # subsample | min | mean (old EXPO used min for edit loss)
+  num_min_qs: 2
+
+  # SAC-specific
+  target_entropy: null

@@ -1,0 +1,313 @@
+# All algorithms should inherit from this base config.
+# Algorithm-specific yaml files can override any value.
+
+experiment:
+  project: test
+  run_group: Debug
+  run_name: Debug
+  wandb_name: test
+  seed: 0
+  log: true
+  save_dir: exp/
+
+env:
+  name: square-mh-low_dim
+  rew_fn: sparse
+  sparse: false
+  post_success_steps: 0
+
+training:
+  bc_pi_steps: 500000
+  bc_q_steps: 0
+  calql_steps: 0
+  q_warmup_steps: 0
+  bc_refine_steps: 0
+  online_steps: 1000000
+  bc_only: false
+  force_jax_sync: true
+  gpu_mode: single              # "single", "multi", or "reserve:N"
+
+buffer:
+  size: 2000000
+  start_training: 10000
+  utd_warmup: 1
+  utd_online: 1
+  utd_q: null               # critic UTD override (defaults to utd_online if null)
+  utd_pi: null              # actor UTD override (defaults to utd_online if null)
+  utd_v: null               # V-fn UTD override; if >utd_q, runs extra V-only updates per env step
+  offline_ratio: 0.0
+
+eval:
+  n_eval_envs: 32
+  eval_episodes: 2
+  video_episodes: 0
+  video_frame_skip: 3
+  plot_q_vs_mc: false
+
+intervals:
+  log_interval: 5000
+  eval_interval_bc: 10000
+  eval_interval: 100000
+  save_interval_bc: -1
+  save_interval: 500000
+  preemption_backup_interval: -1
+  step_data_log_interval: -1
+
+bc:
+  clip_bc: false
+  clip_bc_threshold: 0.45
+  clip_bc_wrt: "ODE"   # "ODE" | "SDE" — which eval to gate BC-early-stop on
+
+success_buffer:
+  use_success_buffer: false
+  batch_size: 256
+
+dataset:
+  proportion: 1.0
+  num_offline_trajs: -1          # -1 = all trajectories; >0 = randomly subsample N full rollouts
+  replace_interval: 1000
+  ogbench_dir: null
+  p_aug: null
+
+checkpoint:
+  restore_actor_path: null
+  restore_critic_path: null
+  restore_encoder_path: null   # path to frozen encoder pkl (from extract_encoder.py)
+  ep_resume: 0
+
+agent:
+  # Identification (set by algorithm-specific config)
+  agent_name: null
+
+  # Placeholders (set automatically at runtime)
+  ob_dims: null
+  action_dim: null
+  q_min: null
+  q_max: null
+
+  # Action bounds (environment-specific, default to normalized [-1, 1])
+  act_min: -1.0
+  act_max: 1.0
+
+  # Learning rates
+  lr: 3e-4
+  actor_lr: 3e-4
+  critic_lr: 3e-4
+  ppo_lr: 4.5e-5
+  clip_grad_norm: 1000.0
+
+  # Scheduler settings
+  actor_scheduler: cosine
+  critic_scheduler: constant
+  use_constant_scheduler_for_bc: true
+
+  # Cosine scheduler parameters
+  actor_warmup_steps: 2000
+  actor_decay_steps: 50000
+  actor_end_value: 2e-5
+  critic_warmup_steps: 500
+  critic_decay_steps: 5000
+  critic_end_value: 0.0
+  actor_weight_decay: 0.0
+  critic_weight_decay: 1e-5
+
+  # Optimizer
+  use_muon: false
+  muon_beta: 0.95
+  muon_ns_steps: 5
+  muon_nesterov: true
+
+  # Batch sizes
+  batch_size: 256
+  ppo_batch_size: 256
+
+  # Architecture
+  actor_hidden_dims: [512, 512, 512, 512]
+  value_hidden_dims: [512, 512, 512, 512]
+  layer_norm: true
+  actor_layer_norm: false
+
+  # Target network
+  tau: 0.005
+  actor_tau: 0.005
+
+  # Critic ensemble
+  q_agg: mean
+  subsample_bon: true
+  num_qs: 10
+  # CalQL critic-pretraining phase (active only when training.calql_steps > 0).
+  cql_alpha: 5.0          # weight on the conservative (CQL) regularizer; Cal-QL
+                          # literature default ~5-10. 0.01 makes it a no-op.
+  cql_temp: 1.0           # logsumexp temperature over sampled actions
+  cql_n_actions: 10       # # actions sampled per source (random/current/next)
+  calql_q_subsample: 2    # # Q-heads subsampled for the CQL term (REDQ-style)
+
+  # Q-target variance reduction
+  q_variance_reduction: false
+  q_vr_num_samples: 8
+  q_vr_reduction: mean      # mean | median | trimmed_mean
+
+  # MC regression (Q-value calibration)
+  mc_regression: false
+  mc_regression_coeff: 1.0
+
+  # Success buffer for critic
+  use_success_buffer_q: false
+
+  # MIP-Q Configuration
+  use_mip_q: false                 # Enable MIP-Q critic (replaces ensemble-Q)
+  mip_q_ensemble: false            # If true: explicit ensemble (multiple networks, single noise)
+                                   # If false: implicit ensemble (single network, multiple noises)
+  mip_q_noise_scale: 1.0           # Scale for uniform noise: samples from [-u, u]
+  mip_q_t_star: 0.9                # Time step for second MIP refinement stage
+  num_ensemble_members: 10         # Number of ensemble members (networks if explicit, noises if implicit)
+
+  # Environment (set at runtime)
+  discount: 0.99
+  horizon_length: 4
+  action_chunking: true
+  encoder: null
+
+  # Vision configuration
+  actor_obs: state            # 'state' or 'image'
+  critic_obs: state           # 'state' or 'image'
+  vit_encoder: minvit         # minvit | minvit_small | minvit_large
+  vit_state_proj_dim: 0       # 0 = raw concat, >0 = Dense projection before concat
+  vit_img_proj_dim: 0         # 0 = raw flatten (15k+ dims!), >0 = Dense+LN projection
+  freeze_vision_encoder: false # If true, freeze encoder after BC and store embeddings in RB
+  proprio_dim: null            # set at runtime from observation shape
+  use_state: proprio           # DEFAULT: 'proprio' (robot proprio only, e.g. 9D for square).
+                               # 'full' = full_states (proprio + object pose, e.g. 23D for square)
+                               #          — opt-in only; image baselines must NOT use full state by default
+                               #          since object pose is privileged info no real-world policy gets.
+                               # Only affects image+frozen-encoder runs that have full_states in the dataset.
+  paligemma_tokenizer_path: null  # Override for the PaliGemma tokenizer.
+                                  # Accepts: HF repo id, local dir (with tokenizer.model),
+                                  # or a raw SentencePiece .model file.
+                                  # If null, paligemma.py resolves it from:
+                                  #   $PALIGEMMA_TOKENIZER_PATH env var, then
+                                  #   /opt/paligemma_tokenizer/tokenizer.model (baked into Docker), then
+                                  #   HF fallback (unsloth/gemma-2-2b).
+
+  # Architecture variants (Transformer, SimBa, FiLM)
+  useSimBa: false
+  useFiLM: false
+
+  # One-step policy (FQL distillation)
+  use_one_step_policy: false          # Enable one-step policy for FQL
+  one_step_hidden_dims: [512, 512, 512, 512]
+  one_step_layer_norm: false
+  one_step_lr: null                   # Defaults to actor_lr if null
+  one_step_scheduler: null            # Defaults to actor_scheduler if null
+  one_step_warmup_steps: null         # Defaults to actor_warmup_steps if null
+  one_step_decay_steps: null          # Defaults to actor_decay_steps if null
+  one_step_end_value: null            # Defaults to actor_end_value if null
+  train_one_step_in_offline: true     # Train one-step during offline phase
+  train_one_step_in_online: true      # Train one-step during online phase
+  fql_distillation_coeff: 10.0        # FQL alpha: weight for distillation loss vs Q-maximization (range: 1-1000)
+  fql_train_main_policy: true         # When false, skips main policy PG/advantage training during FQL (only trains one-step policy + critic)
+  useTF: false              # convenience: sets both backbones to tf
+  actor_backbone: mlp       # mlp or tf (independent of critic)
+  critic_backbone: mlp      # mlp or tf (independent of actor)
+  tf_pi_layers: 5
+  tf_pi_embed_dim: 128
+  tf_pi_heads: 8
+  tf_pi_dropout: 0.0
+  tf_pi_conditioning: adaln   # adaln or cross_attn
+  tf_q_conditioning: adaln    # adaln or cross_attn
+  tf_q_layers: 5
+  tf_q_embed_dim: 128
+  tf_q_heads: 8
+  tf_q_dropout: 0.0
+  simba_actor_hidden_dims: [1024, 1024]
+  simba_critic_hidden_dims: [1024, 1024, 1024]
+
+  # Flow matching
+  flow_steps: 10
+  ft_flow_steps: 10          # 0 = use flow_steps; >0 = override during RL finetuning
+  policy_type: flow
+  mip_t_star: 0.999
+
+  # Flow timestep encoding
+  time_embedding: sinusoidal  # scalar (raw t concat) | sinusoidal (sin/cos + MLP, ala DPPO/DiT/Pi0)
+  time_embedding_dim: 32     # output dim of sinusoidal embedding (ignored when scalar)
+
+  # Flow sampling options
+  clip_intermediate_actions: true
+  denoised_clip_value: 1.0
+  normalize_denoising_horizon: false
+  normalize_act_space_dimension: false
+  use_shortcut: false
+  shortcut_inference_steps: 4
+  shortcut_denoising_steps: 4
+  bootstrap_ratio: 0.5
+
+  # Denoiser / SDE options
+  use_denoiser: false
+  use_constant_noise: true
+  constant_noise_std: 0.01
+  min_noise_std: 0.01
+  max_noise_std: 0.01
+  noise_net_hidden_dims: [256, 256]
+  noise_net_layer_norm: true
+
+  # Advantage clipping (OGPO)
+  adv_clip_min: null
+  clip_min_epsilon_multiplier: 1.0
+  clip_max_epsilon_multiplier: 1.0
+
+  # HLGauss
+  critic_loss_type: mse
+  num_bins: 256
+  action_repeat: false
+
+  # Best-of-N
+  best_of_n: 8
+
+  # Sampling
+  randn_clip_value: 3.0
+
+  # DSRL/SAC specific
+  entropy_backup: false
+  init_temperature: 1.0
+  target_entropy: null
+  noise_dim: null
+  lr_actor: null
+  lr_critic: null
+  lr_actor_bc_flow: null
+  lr_noise_critic: null
+  noise_critic_grad_steps: 1
+  optimizer_actor: adam
+  optimizer_critic: adam
+  optimizer_actor_bc_flow: adam
+
+  # BPTT specific
+  bptt_num_samples: 4
+
+  # QC/ACFQL specific
+  alpha: 0.1
+  actor_type: best-of-n
+  actor_num_samples: 16
+
+  # EXPO specific
+  n_action_samples: 8
+  n_edit_samples: 8
+  edit_policy_bound: 0.1
+  edit_hidden_dims: [256, 256, 256]
+  edit_layer_norm: true
+  edit_lr: 3e-4
+  edit_weight_decay: 0.0
+
+  # DSRL+EXPO specific
+  use_edit_actor: false
+  edit_action_scale: 0.5
+  edit_start_step: 100000
+  action_num_qs: 10
+  lr_action_critic: null
+  lr_edit_actor: null
+  action_critic_hidden_dims: null
+  edit_actor_hidden_dims: null
+  edit_init_temperature: 1.0
+  edit_target_entropy: null
+  optimizer_action_critic: null
+  optimizer_edit_actor: null

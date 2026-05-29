@@ -1,0 +1,42 @@
+# =============================================================================
+# DSRL Configuration
+# =============================================================================
+# Diffusion-based RL: SAC actor in noise space + frozen BC flow matching
+
+_base_: common.yaml
+
+agent:
+  agent_name: dsrl
+
+  # DSRL-specific learning rates
+  lr_actor: 3e-4
+  lr_critic: 3e-4
+  lr_actor_bc_flow: 3e-4
+
+  # Optimizer types
+  optimizer_actor: adam
+  optimizer_critic: adam
+  optimizer_actor_bc_flow: adam
+
+  # DSRL-specific parameters
+  action_magnitude: 1.5
+  noise_chunk_length: -1
+  bc_coeff: 0.1
+
+  # SAC hyperparameters
+  init_temperature: 1.0
+  target_entropy: null              # auto-computed as -noise_dim/2
+
+  # Entropy backup in critic TD target
+  entropy_backup: false
+
+  # Gradient clipping
+  clip_grad_norm: 1.0
+
+  # Flow timestep encoding
+  time_embedding: sinusoidal
+  time_embedding_dim: 32
+
+  # Flow steps
+  flow_steps: 10
+  ft_flow_steps: 10

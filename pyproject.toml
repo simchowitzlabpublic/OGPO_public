@@ -1,0 +1,151 @@
+[build-system]
+requires = ["uv_build>=0.9.0"]
+build-backend = "uv_build"
+
+[project]
+name = "ogpo"
+version = "0.1.0"
+description = "OGPO: Flow-matching RL with GRPO policy gradients and baseline algorithms"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # ==================================================================================
+    # Core scientific computing
+    # ==================================================================================
+    "numpy>=2.3.5",
+    "scikit-learn>=1.8.0",
+    "scikit-image>=0.26.0",
+
+    # ==================================================================================
+    # Visualization
+    # ==================================================================================
+    "matplotlib>=3.10.8",
+    "Pillow>=12.1.0",
+    "opencv-python>=4.11.0.86",
+    "imageio>=2.37.2",
+    "imageio-ffmpeg>=0.6.0",
+
+    # ==================================================================================
+    # JAX ecosystem
+    # ==================================================================================
+    "jax>=0.9.0",
+    "flax>=0.12.3",
+    "optax>=0.2.6",
+    "chex>=0.1.91",
+    "distrax>=0.1.5",
+    "einops>=0.8.2",
+
+    # ==================================================================================
+    # RL environments & datasets
+    # ==================================================================================
+    "gymnasium>=1.2.3",
+    "gymnasium-robotics>=1.4.2",
+    "gym>=0.26.2",
+    "ogbench>=1.2.1",
+    "minari>=0.5.3",
+    "pygame>=2.6.1",
+    "pymunk>=7.2.0",
+    "shapely>=2.1.2",
+
+    # ==================================================================================
+    # Data I/O
+    # ==================================================================================
+    "h5py>=3.15.1",
+    "zarr>=3.1.5",
+    "gdown>=5.2.1",
+
+    # ==================================================================================
+    # Experiment tracking & logging
+    # ==================================================================================
+    "wandb>=0.24.1",
+
+    # ==================================================================================
+    # Configuration
+    # ==================================================================================
+    "PyYAML>=6.0.3",
+
+    # ==================================================================================
+    # Utilities
+    # ==================================================================================
+    "tqdm>=4.67.1",
+    "psutil>=7.2.2",
+
+    # ==================================================================================
+    # Dimensionality reduction
+    # ==================================================================================
+    "umap-learn>=0.5.11",
+]
+
+
+[project.optional-dependencies]
+cuda12 = [
+    "jax[cuda12]>=0.9.0.1",
+    "jaxlib>=0.9.0.1",
+]
+cuda13 = [
+    "jax[cuda13]>=0.9.0",
+    "jaxlib>=0.9.0",
+]
+robomimic = [
+    "robomimic",
+    "robosuite>=1.5.0",
+    "torch",
+    "torchvision",
+]
+
+
+[dependency-groups]
+dev = [
+    # ==================================================================================
+    # Testing
+    # ==================================================================================
+    "pytest",
+
+    # ==================================================================================
+    # Debugging, interactive Python and Jupyter notebooks
+    # ==================================================================================
+    "ipdb",
+    "ipykernel",
+    "ipywidgets",
+    "pyreadline3",
+    "tqdm",
+    "jupyterlab",
+    "jupyter-book",
+]
+
+[project.scripts]
+ogpo-train = "ogpo.main:main"
+
+[tool.uv.build-backend]
+module-name = ["ogpo", "envs"]
+module-root = ""
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cuda12" },
+        { extra = "cuda13" },
+    ],
+]
+
+# Override HF packages that robomimic downgrades to incompatible versions.
+# Also exclude evdev (requires python3-dev / sudo) — pulled in by robosuite→pynput,
+# not needed for headless training.
+override-dependencies = [
+    "diffusers==0.35.2",
+    "huggingface-hub==0.36.0",
+    "transformers==4.57.1",
+    "evdev ; sys_platform == 'never'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+robomimic = { git = "https://github.com/ARISE-Initiative/robomimic.git" }
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+torchaudio = [{ index = "pytorch-cpu" }]

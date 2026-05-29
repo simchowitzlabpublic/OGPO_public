@@ -1,0 +1,67 @@
+# =============================================================================
+# DSRL+EXPO Configuration
+# =============================================================================
+# DSRL with EXPO-style edit actor refinement
+
+_base_: common.yaml
+
+agent:
+  # Identification
+  agent_name: dsrl_plus_expo
+
+  # DSRL+EXPO learning rates
+  lr_actor: 3e-4
+  lr_critic: 3e-4
+  lr_actor_bc_flow: 3e-4
+  lr_edit_actor: 3e-4
+  lr_action_critic: 3e-4
+
+  # Optimizer types
+  optimizer_actor: adam
+  optimizer_critic: adam
+  optimizer_actor_bc_flow: adam
+  optimizer_action_critic: adam
+  optimizer_edit_actor: adam
+
+  # DSRL parameters
+  action_magnitude: 1.5           # match original DSRL repo (wider noise bounds)
+  noise_chunk_length: -1
+  num_action_samples: 16
+  bc_coeff: 0.1
+
+  # DSRL+EXPO specific (edit actor)
+  use_edit_actor: false
+  n_edit_samples: 8
+  edit_action_scale: 0.5
+  edit_start_step: 100000
+
+  # Edit actor hyperparameters
+  edit_actor_hidden_dims: [512, 512, 512, 512]
+  edit_target_entropy: null
+  entropy_scale: 1.0
+
+  # Action critic hyperparameters
+  action_num_qs: 10
+  action_critic_hidden_dims: [512, 512, 512, 512]
+  action_critic_tau: 0.005
+
+  # SAC-specific
+  init_temperature: 1.0
+  edit_init_temperature: 1.0
+  target_entropy: null
+  entropy_backup: true
+
+  # Noise critic distillation
+  lr_noise_critic: 3e-4
+  noise_critic_grad_steps: 10     # match original DSRL repo
+
+  # Gradient clipping (safety net for SAC in noise space)
+  clip_grad_norm: 1.0
+
+  # Flow timestep encoding
+  time_embedding: sinusoidal  # scalar | sinusoidal
+  time_embedding_dim: 32
+
+  # Flow steps
+  flow_steps: 10
+  ft_flow_steps: 10

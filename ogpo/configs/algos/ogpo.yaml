@@ -1,0 +1,208 @@
+# =============================================================================
+# OGPO Configuration
+# =============================================================================
+# Matches scripts/ogpo/ogpo_square.sh from old sbp_spl codebase exactly.
+
+_base_: common.yaml
+
+experiment:
+  project: OGPO_square_ablations
+  run_group: square
+  run_name: square_flow
+  wandb_name: square_flow
+  seed: 82723
+  log: true
+  save_dir: exp/
+
+env:
+  name: square-mh-low_dim
+  rew_fn: sparse
+  sparse: false
+  post_success_steps: 0
+
+training:
+  bc_pi_steps: 500000
+  bc_q_steps: 0
+  calql_steps: 0
+  q_warmup_steps: 0
+  bc_refine_steps: 0
+  online_steps: 2000000
+  bc_only: false
+  force_jax_sync: true
+
+buffer:
+  size: 2000000
+  start_training: 10000
+  utd_warmup: 1
+  utd_online: 1
+  offline_ratio: 0.0
+
+eval:
+  n_eval_envs: 32
+  eval_episodes: 2
+  plot_q_vs_mc: false
+
+intervals:
+  log_interval: 5000
+  eval_interval_bc: 5000
+  eval_interval: 20000
+  save_interval_bc: -1
+  save_interval: 500000
+  preemption_backup_interval: -1
+  step_data_log_interval: -1
+
+bc:
+  clip_bc: true
+  clip_bc_threshold: 0.45
+  clip_bc_wrt: "ODE"   # "ODE" | "SDE" — OGPO low_dim scripts override to "SDE"
+
+success_buffer:
+  use_success_buffer: true
+  batch_size: 256
+
+dataset:
+  proportion: 1.0
+
+checkpoint:
+  restore_actor_path: null
+  restore_critic_path: null
+  ep_resume: 0
+
+agent:
+  agent_name: ogpo
+
+  # Learning rates
+  lr: 3e-4
+  actor_lr: 3e-4
+  critic_lr: 3e-4
+  ppo_lr: 4.5e-5
+  clip_grad_norm: 1000.0
+
+  # Target network EMA
+  tau: 0.05
+  actor_tau: 0.05
+
+  # PPO parameters
+  ppo_batch_size: 256
+  clip_epsilon: 0.01
+  entropy_coeff: 0.0
+  use_constant_scheduler_for_bc: true
+
+  # GRPO parameters
+  group_num_samples: 32
+
+  # BC regularization
+  use_bc_regularization: true
+  bc_coeff: 0.1
+
+  # Noise network (constant noise for SDE sampling)
+  use_constant_noise: true
+  constant_noise_std: 0.005
+  min_noise_std: 0.005
+  max_noise_std: 0.005
+
+  # Q-target variance reduction
+  q_variance_reduction: false
+  q_vr_num_samples: 8
+  q_vr_reduction: mean      # mean | median | trimmed_mean
+
+  # Value function V(s) — ablation for eliminating multi-action Q-target rollouts
+  use_value_fn: false
+  v_ensemble_size: 10
+  v_agg: mean                   # mean | min | subsample
+  v_training_mode: td_offpolicy # td_offpolicy | bc_q_mean
+  v_loss_coeff: 1.0
+  v_pair_with_q: false          # If true, supervise V_i per-head (requires v_ensemble_size==num_qs)
+  adv_baseline: group_mean      # group_mean | v_fn
+
+  # MC regression (Q-value calibration)
+  mc_regression: false
+  mc_regression_coeff: 1.0
+
+  # Success buffer for critic
+  use_success_buffer_q: false
+
+  # Flow timestep encoding
+  time_embedding: sinusoidal  # scalar | sinusoidal
+  time_embedding_dim: 32
+
+  # Policy settings
+  flow_steps: 10
+  ft_flow_steps: 10          # 0 = use flow_steps; >0 = override during RL finetuning
+  best_of_n: 8
+  normalize_group: false
+  clip_min_epsilon_multiplier: 1.0
+  clip_max_epsilon_multiplier: 1.0
+  adv_clip_min: null
+  adv_strategy: vanilla  # vanilla | conservative | awr
+  awr_beta: 0.05
+
+  # Logprob normalization (matches old code defaults)
+  normalize_denoising_horizon: true
+  normalize_act_space_dimension: true
+
+  # SDE-ODE correction
+  error_correct_sde_to_ode: true
+  use_denoiser: true
+
+  # AWR (Advantage-Weighted Regression) settings
+  use_awr: false              # Toggle AWR weighted-CFM loss vs OGPO log-prob ratio
+  awr_n_mc: 16                # Number of (tau, eps) MC samples for AWR CFM loss
+  awr_weight_max: 20.0        # Clamp AWR weights (exp(A/β)) for stability
+  awr_mode: symmetric         # symmetric | asymmetric | positive_only
+
+  # FPO (Flow Policy Optimization) settings
+  use_fpo: false              # Toggle FPO ratio vs OGPO log-prob ratio
+  fpo_n_mc: 16                # Number of (tau, eps) MC samples for CFM loss
+  fpo_per_sample: true        # FPO++ per-sample ratio clipping
+  fpo_use_aspo: false         # FPO++ ASPO trust region (SPO for negative adv)
+  fpo_zero_sampling: false    # FPO++ zero-sampling at eval (ODE from 0)
+  fpo_cfm_loss_clamp: 4.0     # Clamp individual CFM losses (ref FPO uses 4.0)
+  fpo_cfm_diff_clamp: 5.0     # Clamp CFM loss difference before exp
+  fpo_use_huber: false         # Use Huber loss instead of MSE for CFM (ref uses True)
+  fpo_huber_delta: 1.0         # Huber delta (ref sweeps 0.5-2.0)
+
+  # ---- Slow reference policy (pi_slow) ----
+  # Shared by chi_po (chi^2 pessimism), kl_reg (reverse KL), fwd_kl_reg (forward
+  # KL via BC). Initialized at start of online phase as a snapshot of the BC
+  # actor; updated each actor step via Polyak EMA at rate `tau_slow`.
+  tau_slow: 0.0005                  # EMA rate for pi_slow (vs actor_tau=0.05 for target)
+  chi_po_ref_tau: 0.0005            # legacy alias of tau_slow; kept for back-compat with older scripts
+
+  # chi2-Pessimistic OGPO (chiPO)
+  chi_po: false
+  chi_po_beta_base: 0.1
+  chi_po_q_std_target: 1.0
+  chi_po_ensemble_alpha: 5.0
+  chi_po_R_max: 10.0                # calibrate per env: ~1/(1-gamma) for sparse reward
+
+  # KL-Pessimistic OGPO (reverse KL; stacks with chi_po)
+  kl_reg: false
+  kl_reg_beta_base: 0.1
+  kl_reg_ensemble_alpha: 5.0
+  kl_reg_R_max: 10.0
+
+  # Forward-KL regularization: BC flow-matching against samples from pi_slow
+  # (KL(pi_slow || pi)). Pulls pi toward covering all modes of pi_slow.
+  fwd_kl_reg: false
+  fwd_kl_bc_coeff: 0.1
+
+  # FQL (Flow Q-Learning) settings - One-Step Policy
+  use_one_step_policy: false           # Enable one-step policy for FQL
+  train_one_step_in_offline: false     # Train one-step policy during offline/BC phase
+  train_one_step_in_online: false      # Train one-step policy during online RL phase
+  fql_distillation_coeff: 10.0         # Alpha: weight for distillation vs Q-maximization
+  fql_train_main_policy: true          # When false, disables main policy PG/advantage training
+  use_one_step_for_targets: false      # Use one-step policy for computing TD targets
+  use_one_step_for_rollouts: false     # Use one-step policy for online rollouts
+
+  # Architecture backbone (independent for actor/critic)
+  actor_backbone: mlp       # mlp | tf
+  critic_backbone: mlp      # mlp | tf
+  actor_hidden_dims: [512, 512, 512, 512]
+  value_hidden_dims: [512, 512, 512, 512]
+
+  # Vision configuration (active when env has image observations)
+  actor_obs: state           # state | image
+  critic_obs: state          # state | image
+  vit_encoder: minvit        # minvit | minvit_small | minvit_large
