@@ -325,6 +325,7 @@ uv run python ogpo/main.py \
     --agent.freeze_vision_encoder=$freeze_vision_encoder \
     --agent.obs_two_tier=$obs_two_tier \
     --agent.two_tier_fused_dim=$two_tier_fused_dim \
+    --agent.use_state=$use_state \
     --agent.encoder_device=$encoder_device \
     --agent.chi_po=$chi_po \
     --agent.chi_po_beta_base=$chi_po_beta_base \
