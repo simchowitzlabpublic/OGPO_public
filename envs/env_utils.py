@@ -9,7 +9,6 @@ from gymnasium.spaces import Box
 
 from ogpo.utils.datasets import Dataset
 from envs import gymnasium_robotics_utils
-# from envs import d3il_utils
 
 GYMNASIUM_ROBOTICS_ADROITHAND_ENVS = [
     'AdroitHandDoor-v1',
@@ -106,13 +105,7 @@ class FrameStackWrapper(gymnasium.Wrapper):
 def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, rew_fn='sparse', post_success_steps=0):
     """Make offline RL environment and datasets.
 
-    Args:
-        env_name: Name of the environment or dataset.
-        frame_stack: Number of frames to stack.
-        action_clip_eps: Epsilon for action clipping.
-
-    Returns:
-        A tuple of the environment, evaluation environment, training dataset, and validation dataset.
+    Returns (env, eval_env, train_dataset, val_dataset).
     """
 
     if 'singletask' in env_name:

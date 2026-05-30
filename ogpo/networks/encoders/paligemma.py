@@ -33,11 +33,7 @@ import numpy as np
 import flax.linen as nn
 
 
-# ---------------------------------------------------------------------------
-# Per-task text instructions for robomimic environments.
-# Keyed by the task prefix of the env name (env_name.split("-")[0]).
-# ---------------------------------------------------------------------------
-
+# Per-task text instructions, keyed by env name prefix (env_name.split("-")[0]).
 ROBOMIMIC_PROMPTS = {
     "lift": "pick up the small cube from the table",
     "can": "pick up the coke can and place it in the bin",
@@ -59,9 +55,7 @@ def _prompt_for_env(env_name: str) -> str:
     return ROBOMIMIC_PROMPTS[task]
 
 
-# ---------------------------------------------------------------------------
-# SigLIP architecture (unchanged: hand-port of openpi siglip.py)
-# ---------------------------------------------------------------------------
+# SigLIP architecture (hand-port of openpi siglip.py).
 
 def posemb_sincos_2d(h, w, width, temperature=10_000.0, dtype=jnp.float32):
     y, x = jnp.mgrid[:h, :w]
@@ -228,7 +222,6 @@ class SigLIPViT(nn.Module):
         return x  # (B, 256, num_classes)
 
 
-# ---------------------------------------------------------------------------
 # Gemma 2B language trunk (Flax port keyed to the Pi0/Pi0.5 checkpoint layout
 # under params/PaliGemma/llm; identical between pi05_base and pi05_libero).
 #
@@ -243,7 +236,6 @@ class SigLIPViT(nn.Module):
 #   layers/pre_attention_norm/scale        (depth, hidden)
 #   layers/pre_ffw_norm/scale              (depth, hidden)
 # (the *_1 / final_norm_1 keys belong to the Pi0.5 action expert; ignored.)
-# ---------------------------------------------------------------------------
 
 GEMMA_CONFIG = dict(
     depth=18,
@@ -312,24 +304,22 @@ class GemmaAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        # Q: einsum('btd,hde->bthe', x, w_q) — w_q shape (H, D, head_dim)
         w_q = _ParamHolder(
             shape=(self.num_heads, self.hidden, self.head_dim), name="q_einsum"
         )()
         q = jnp.einsum("btd,hde->bthe", x, w_q)
 
-        # KV: shape (2, num_kv, D, head_dim). [0]=K, [1]=V.
+        # kv_einsum w shape (2, num_kv, D, head_dim); index 0=K, 1=V.
         w_kv = _ParamHolder(
             shape=(2, self.num_kv_heads, self.hidden, self.head_dim), name="kv_einsum"
         )()
-        kv = jnp.einsum("btd,sNde->sbtNe", x, w_kv)  # s in {0,1}=k,v ; N=num_kv
+        kv = jnp.einsum("btd,sNde->sbtNe", x, w_kv)
         k, v = kv[0], kv[1]  # each (B, T, num_kv, head_dim)
 
-        # RoPE on Q and K (positions 0..T-1 are implicit in _apply_rope).
+        # RoPE positions 0..T-1 are implicit in _apply_rope.
         q = _apply_rope(q, self.rope_theta)
         k = _apply_rope(k, self.rope_theta)
 
-        # Scale Q.
         q = q * (self.head_dim ** -0.5)
 
         # MQA / GQA broadcast: repeat K,V from num_kv to num_heads.
@@ -338,13 +328,11 @@ class GemmaAttention(nn.Module):
             k = jnp.repeat(k, repeat, axis=2)
             v = jnp.repeat(v, repeat, axis=2)
 
-        # Attention: full bidirectional over the (image+text) prefix.
-        # attn[b,h,t,s] = sum_d q[b,t,h,d] * k[b,s,h,d]
+        # Full bidirectional attention over the (image+text) prefix.
         attn = jnp.einsum("bthd,bshd->bhts", q, k)
         attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(x.dtype)
-        out = jnp.einsum("bhts,bshd->bthd", attn, v)  # (B,T,H,head_dim)
+        out = jnp.einsum("bhts,bshd->bthd", attn, v)  # (B, T, H, head_dim)
 
-        # Output projection: shape (H, head_dim, D).
         w_o = _ParamHolder(
             shape=(self.num_heads, self.head_dim, self.hidden), name="attn_vec_einsum"
         )()
@@ -357,7 +345,7 @@ class GemmaMLP(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        # gating_einsum shape (2, hidden, mlp_hidden). [0]=gate, [1]=up.
+        # gating_einsum shape (2, hidden, mlp_hidden); index 0=gate, 1=up.
         w_gating = self.param(
             "gating_einsum",
             nn.initializers.zeros,
@@ -437,9 +425,8 @@ class GemmaTrunk(nn.Module):
         return GemmaRMSNorm(self.hidden, self.rms_eps, name="final_norm")(x)
 
 
-# Kept as a separate sub-Module so its param key is `embedder/input_embedding`,
+# Separate sub-Module so its param key is `embedder/input_embedding`,
 # matching the checkpoint layout.
-
 class GemmaEmbedder(nn.Module):
     vocab: int
     hidden: int
@@ -456,19 +443,11 @@ class GemmaEmbedder(nn.Module):
         return emb[token_ids] * jnp.sqrt(self.hidden).astype(jnp.float32)
 
 
-# ---------------------------------------------------------------------------
-# Image preprocessing (unchanged)
-# ---------------------------------------------------------------------------
-
 def preprocess_images(images, target_size=224):
-    """Resize and normalize images for SigLIP. Splits multi-camera channels.
+    """Resize and normalize (B, H, W, C) images for SigLIP, splitting multi-camera channels.
 
-    Args:
-        images: (B, H, W, C) numpy uint8 or float [0, 255]. C must be a multiple of 3.
-        target_size: Target image size (224 for PaliGemma).
-
-    Returns:
-        (B * num_cams, target_size, target_size, 3) float32 in [-1, 1].
+    Returns (B * num_cams, target_size, target_size, 3) float32 in [-1, 1].
+    C must be a multiple of 3.
     """
     from PIL import Image as PILImage
 
@@ -502,10 +481,6 @@ def preprocess_images(images, target_size=224):
     images = (images - 0.5) / 0.5
     return images
 
-
-# ---------------------------------------------------------------------------
-# Checkpoint + tokenizer loading
-# ---------------------------------------------------------------------------
 
 def _load_paligemma_params(checkpoint_path):
     """Load img + llm subtrees from a Pi0/Pi0.5 orbax checkpoint.
@@ -695,10 +670,6 @@ def _tokenize_prompt(tokenizer, prompt: str, max_len: int = 64) -> np.ndarray:
     return ids
 
 
-# ---------------------------------------------------------------------------
-# Public API: build a frozen VL encoder for a given env.
-# ---------------------------------------------------------------------------
-
 def load_paligemma_encoder(
     checkpoint_path: str = os.path.expanduser("~/checkpoints/pi05_base/params"),
     env_name: str | None = None,
@@ -711,17 +682,9 @@ def load_paligemma_encoder(
 ):
     """Load PaliGemma SigLIP + Gemma LM and return a frozen VL encode function.
 
-    Args:
-        checkpoint_path: Path to Pi0/Pi0.5 orbax checkpoint params dir.
-        env_name: Robomimic env name (e.g. "square-mh-image"). Used to look up
-            the task instruction from ROBOMIMIC_PROMPTS.
-        target_size: Image size fed to SigLIP (224).
-        encoder_device: GPU index to run the encoder on (separate from training GPU).
-        tokenizer_path: Optional local PaliGemma tokenizer snapshot.
-        prompt_max_len: Tokenized prompt length (fixed pad/truncate).
-
-    Returns:
-        encode_fn(observations, images) -> (B, num_cams * 2048 + state_dim) numpy.
+    The returned encode_fn(observations, images) yields a numpy array of shape
+    (B, num_cams * 2048 + state_dim). `env_name` selects the task prompt from
+    ROBOMIMIC_PROMPTS.
     """
     if env_name is None:
         raise ValueError(
@@ -738,7 +701,6 @@ def load_paligemma_encoder(
     text_ids_np = _tokenize_prompt(tokenizer, prompt, max_len=prompt_max_len)
     print(f"[PaliGemma] Prompt token ids (len={len(text_ids_np)}): {text_ids_np.tolist()}")
 
-    # Pick encoder device.
     if encoder_device is not None:
         devices = jax.devices("gpu")
         if encoder_device < len(devices):
@@ -754,7 +716,6 @@ def load_paligemma_encoder(
     llm_params = jax.device_put(llm_params, enc_device)
     text_ids_jax = jax.device_put(jnp.asarray(text_ids_np), enc_device)
 
-    # Build the modules.
     siglip = SigLIPViT(
         num_classes=2048,
         patch_size=(14, 14),
@@ -788,25 +749,17 @@ def load_paligemma_encoder(
 
     @functools.partial(jax.jit, device=enc_device)
     def _encode_vl(siglip_p, emb_p, trunk_p, pixel_values, text_ids):
-        # 1) Vision tokens (B*ncams, 256, 2048).
-        img_tokens = siglip.apply(siglip_p, pixel_values, train=False)
+        img_tokens = siglip.apply(siglip_p, pixel_values, train=False)  # (B*ncams, 256, 2048)
 
-        # 2) Text embeddings broadcast to batch: (B*ncams, T, 2048).
         text_emb = embedder.apply(emb_p, text_ids)  # (T, 2048)
         text_emb = jnp.broadcast_to(
             text_emb[None], (img_tokens.shape[0], text_emb.shape[0], text_emb.shape[1])
         )
 
-        # 3) Concat [image, text] -> (B*ncams, 256+T, 2048).
-        seq = jnp.concatenate([img_tokens, text_emb], axis=1)
-
-        # 4) Run Gemma trunk (RoPE positions are implicit, 0..T-1 inside attention).
+        seq = jnp.concatenate([img_tokens, text_emb], axis=1)  # (B*ncams, 256+T, 2048)
         seq = trunk.apply(trunk_p, seq)
+        return seq.mean(axis=1)  # mean-pool image+text -> (B*ncams, 2048)
 
-        # 5) Mean-pool over all tokens (image + text).
-        return seq.mean(axis=1)  # (B*ncams, 2048)
-
-    # Shape verification.
     dummy_img = jax.device_put(jnp.zeros((1, target_size, target_size, 3)), enc_device)
     try:
         out = _encode_vl(siglip_params, embedder_params, trunk_params, dummy_img, text_ids_jax)
@@ -821,9 +774,8 @@ def load_paligemma_encoder(
     def encode_fn(observations, images):
         """Encode (images, proprio) -> flat VL feature vector.
 
-        Supports multi-camera: if C = 3·num_cams, SigLIP runs per-camera, Gemma
-        runs per-camera, and the resulting features are concatenated along the
-        feature axis. Then proprio is appended.
+        Multi-camera (C = 3·num_cams) is run per-camera and the per-camera
+        features are concatenated along the feature axis, then proprio appended.
         """
         squeeze = images.ndim == 3
         if squeeze:

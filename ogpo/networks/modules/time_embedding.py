@@ -13,26 +13,14 @@ import jax.numpy as jnp
 class SinusoidalTimeEmbedding(nn.Module):
     """Sinusoidal positional embedding for scalar timesteps.
 
-    Pipeline: scalar t → sinusoidal features → Linear → GELU → Linear
-
-    Attributes:
-        embed_dim: Output embedding dimension (must be even).
-        max_freq_log: Log of maximum frequency (DPPO uses log(10000) ≈ 9.21).
+    Pipeline: scalar t -> sinusoidal features -> Linear -> GELU -> Linear.
     """
     embed_dim: int = 32
     max_freq_log: float = math.log(10000)
 
     @nn.compact
     def __call__(self, t):
-        """Embed scalar timestep(s).
-
-        Args:
-            t: Timestep tensor, shape (..., 1) or (...,).
-
-        Returns:
-            Embedding tensor, shape (..., embed_dim).
-        """
-        # Flatten trailing dim if shape is (..., 1)
+        """Embed scalar timestep(s) of shape (..., 1) or (...,) to (..., embed_dim)."""
         if t.shape[-1] == 1:
             t = t[..., 0]
 
@@ -44,7 +32,6 @@ class SinusoidalTimeEmbedding(nn.Module):
         angles = t[..., None] * freqs
         emb = jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
 
-        # Small MLP: Linear → GELU → Linear (matches DPPO/DiT convention)
         emb = nn.Dense(self.embed_dim * 2)(emb)
         emb = nn.gelu(emb)
         emb = nn.Dense(self.embed_dim)(emb)

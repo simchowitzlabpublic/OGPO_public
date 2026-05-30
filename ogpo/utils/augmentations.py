@@ -6,13 +6,7 @@ from functools import partial
 
 @partial(jax.jit, static_argnames=('padding',))
 def random_crop(img, crop_from, padding):
-    """Randomly crop an image.
-
-    Args:
-        img: Image to crop.
-        crop_from: Coordinates to crop from.
-        padding: Padding size.
-    """
+    """Randomly crop an image."""
     padded_img = jnp.pad(img, ((padding, padding), (padding, padding), (0, 0)), mode='edge')
     return jax.lax.dynamic_slice(padded_img, crop_from, img.shape)
 
@@ -24,18 +18,9 @@ def batched_random_crop(imgs, crop_froms, padding):
 
 
 def rgb_to_hsv(r, g, b):
-    """Converts R, G, B  values to H, S, V values.
-    Reference TF implementation:
-    https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/adjust_saturation_op.cc
-    Only input values between 0 and 1 are guaranteed to work properly, but this
-    function complies with the TF implementation outside of this range.
-    Args:
-        r: A tensor representing the red color component as floats.
-        g: A tensor representing the green color component as floats.
-        b: A tensor representing the blue color component as floats.
-    Returns:
-        H, S, V values, each as tensors of shape [...] (same as the input without
-        the last dimension).
+    """Convert R, G, B values to H, S, V values.
+
+    Only input values in [0, 1] are guaranteed to work properly.
     """
     vv = jnp.maximum(jnp.maximum(r, g), b)
     range_ = vv - jnp.minimum(jnp.minimum(r, g), b)
@@ -54,17 +39,9 @@ def rgb_to_hsv(r, g, b):
 
 
 def hsv_to_rgb(h, s, v):
-    """Converts H, S, V values to an R, G, B tuple.
-    Reference TF implementation:
-    https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/kernels/adjust_saturation_op.cc
-    Only input values between 0 and 1 are guaranteed to work properly, but this
-    function complies with the TF implementation outside of this range.
-    Args:
-        h: A float tensor of arbitrary shape for the hue (0-1 values).
-        s: A float tensor of the same shape for the saturation (0-1 values).
-        v: A float tensor of the same shape for the value channel (0-1 values).
-    Returns:
-        An (r, g, b) tuple, each with the same dimension as the inputs.
+    """Convert H, S, V values to an (R, G, B) tuple.
+
+    Only input values in [0, 1] are guaranteed to work properly.
     """
     c = s * v
     m = v - c
@@ -144,14 +121,10 @@ def _color_transform_single_image(image, rng, brightness, contrast, saturation,
     perm_rng, b_rng, c_rng, s_rng, h_rng, cj_rng, gs_rng = jax.random.split(
         transform_rng, 7)
 
-    # Whether the transform should be applied at all.
     should_apply = jax.random.uniform(apply_rng, shape=()) <= apply_prob
-    # Whether to apply grayscale transform.
     should_apply_gs = jax.random.uniform(gs_rng, shape=()) <= to_grayscale_prob
-    # Whether to apply color jittering.
     should_apply_color = jax.random.uniform(cj_rng, shape=()) <= color_jitter_prob
 
-    # Decorator to conditionally apply fn based on an index.
     def _make_cond(fn, idx):
 
         def identity_fn(x, unused_rng, unused_param):
@@ -218,21 +191,7 @@ def color_transform(rng,
                     to_grayscale_prob=0.0,
                     apply_prob=1.0,
                     shuffle=True):
-    """Applies color jittering and/or grayscaling to a batch of images.
-    Args:
-        images: an NHWC tensor, with C=3.
-        rng: a single PRNGKey.
-        brightness: the range of jitter on brightness.
-        contrast: the range of jitter on contrast.
-        saturation: the range of jitter on saturation.
-        hue: the range of jitter on hue.
-        color_jitter_prob: the probability of applying color jittering.
-        to_grayscale_prob: the probability of converting the image to grayscale.
-        apply_prob: the probability of applying the transform to a batch element.
-        shuffle: whether to apply the transforms in a random order.
-    Returns:
-        A NHWC tensor of the transformed images.
-    """
+    """Apply color jittering and/or grayscaling to a batch of NHWC images (C=3)."""
     rngs = jax.random.split(rng, images.shape[0])
     jitter_fn = functools.partial(
         _color_transform_single_image,

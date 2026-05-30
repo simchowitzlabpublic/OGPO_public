@@ -1,16 +1,7 @@
-"""OGPO Agents Module.
+"""OGPO agent implementations: OGPO, QC/ACFQL, BPTT, DSRL, EXPO, DSRL+EXPO.
 
-Contains implementations of various RL agents:
-- OGPO (OGPOAgent): Main OGPO algorithm
-- QC/ACFQL (ACFQLAgent): Action-Chunked Flow Q-Learning
-- BPTT (OGPOBPTTAgent): OGPO with BPTT
-- DSRL (DSRLBestOfNAgent): Diffusion-based SRL with Best-of-N
-- EXPO (EXPOAgent): EXPO algorithm
-- DSRL+EXPO (DSRLEXPOAgent): Combined DSRL and EXPO
-
-Note: Import agents lazily to avoid circular imports during module loading.
-Use get_agents_registry() from main.py or import specific agents directly:
-    from ogpo.agents.ogpo import OGPOAgent
+Import agents directly (e.g. ``from ogpo.agents.ogpo import OGPOAgent``) to
+avoid circular imports.
 """
 
 __all__ = [

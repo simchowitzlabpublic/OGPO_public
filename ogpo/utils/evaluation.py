@@ -100,7 +100,6 @@ def add_to(dict_of_lists, single_dict):
 def discounted_returns_from_prefix(rewards, indices, discount=0.99):
     T = len(rewards)
     disc_pows = discount ** np.arange(T)
-    # Rewards are pre-transformed to [-1, 0] by env wrappers (e.g. robomimic step())
     prefix = np.cumsum(np.array(rewards) * disc_pows)
 
     def G(t):
@@ -149,6 +148,7 @@ def visualize_q_accuracy(time_series_data, scatter_data, global_step, suffix, di
     reward_desc = "MC return-to-go (episode end)"
     fig.suptitle(f'Q-Function Accuracy Analysis ({reward_desc})\nStep {global_step} ({suffix})', fontsize=12)
 
+    # Subplot 1: per-episode time series
     # Subplot 1: per-episode time series
     ax1 = axes[0]
     for i, episode in enumerate(time_series_data):
@@ -211,15 +211,13 @@ def _get_critic_obs_for_eval(agent, observation, obs_images, obs_full_state, enc
     if original_critic_obs == 'state' and obs_full_state is not None and use_full_state:
         return obs_full_state, True
     if encoder_frozen and encode_fn is not None and obs_images is not None:
-        # Frozen encoder: encode (state, images) -> embeddings for the critic.
-        # The state side must match dataset pre-encoding: full_state when
-        # use_state='full', else robot proprio only.
+        # Frozen encoder: state side must match dataset pre-encoding (full_state
+        # when use_state='full', else robot proprio only).
         state_for_enc = obs_full_state if (use_full_state and obs_full_state is not None) else observation
         return encode_fn(state_for_enc, obs_images), True
     if obs_images is not None and not encoder_frozen:
-        # Non-frozen image critic: can't use standalone Q helper (no image encoder)
+        # Non-frozen image critic: standalone Q helper has no image encoder.
         return observation, False
-    # State-based environment (no images)
     return observation, True
 
 
@@ -234,18 +232,17 @@ def evaluate(
         suffix = "SDE"
         actor_fn = agent.sample_actions
     else:
-        # Detect which sampling method is being used
         fn_name = getattr(actor_fn, '__name__', '')
         if 'one_step' in fn_name:
             suffix = "OneStep"
         elif 'ode' in fn_name.lower():
             suffix = "ODE"
         else:
-            suffix = "ODE"  # Default for custom functions
+            suffix = "ODE"
 
 
     actor_fn = supply_rng(actor_fn, rng=jax.random.PRNGKey(global_step))
-    # Local seeded RNG for eval noise — avoids global np.random state dependency
+    # Local seeded RNG for eval noise, avoiding global np.random state.
     eval_rng = np.random.default_rng(global_step)
     trajs = []
     stats = defaultdict(list)
@@ -271,13 +268,13 @@ def evaluate(
     # Strip OGPO-only kwargs (images / full_state) for baseline actor_fns.
     _filter_kwargs = _actor_kwargs_filter(actor_fn)
 
-    scatter_data = []   # list of (q_pred, mc_return) across all episodes
+    scatter_data = []   # (q_pred, mc_return) across all episodes
     time_series_data = []  # per-episode lists
     for i in tqdm.tqdm(range(num_eval_episodes + num_video_episodes), dynamic_ncols=True):
         traj = defaultdict(list)
         should_render = i >= num_eval_episodes
 
-        # Seed each episode distinctly for diverse, reproducible resets
+        # Seed each episode distinctly for diverse, reproducible resets.
         raw_observation, info = env.reset(seed=global_step + i)
         observation, obs_images, obs_full_state = _split_obs(raw_observation)
 
@@ -287,7 +284,7 @@ def evaluate(
         action_chunk_lens = defaultdict(lambda: 0)
 
         rewards = []                     # per-step rewards
-        decision_indices = []            # step indices where a new chunk was decided
+        decision_indices = []            # steps where a new chunk was decided
         q_preds_at_decisions = []        # Q(s_t, a_t) at each decision point
         action_chunk_lens = defaultdict(int)
 
@@ -369,13 +366,8 @@ def evaluate(
     return final_stats, trajs, renders
 
 def visualize_q_diagnostics(scatter_data, episode_q_mc_sequences, actions_data, global_step, suffix, dir_suffix, save_dir='./plots'):
-    """
-    Visualizes Q-function diagnostics with four subplots:
-    1. Q vs. MC scatter plot, colored by value.
-    2. Q-value drop vs. MC-return drop scatter plot.
-    3. UMAP of actions colored by Q-values.
-    4. UMAP of (actions + Q-values) colored by Q-values.
-    """
+    """Plot Q-function diagnostics: Q vs MC scatter, value-drop consistency,
+    and UMAPs of actions colored by Q-value."""
     if not scatter_data:
         return
 
@@ -398,7 +390,6 @@ def visualize_q_diagnostics(scatter_data, episode_q_mc_sequences, actions_data, 
     ax1.grid(True, alpha=0.3)
     ax1.set_aspect('equal', 'box')
 
-    # --- Subplot 2: Value Drop Comparison ---
     ax2 = axes[1]
     q_diffs, mc_diffs = [], []
     for q_seq, mc_seq in episode_q_mc_sequences:
@@ -416,18 +407,14 @@ def visualize_q_diagnostics(scatter_data, episode_q_mc_sequences, actions_data, 
     ax2.grid(True, alpha=0.3)
     ax2.set_aspect('equal', 'box')
 
-    # --- Subplot 3: UMAP of Actions colored by Q-values ---
     ax3 = axes[2]
     if actions_data is not None and len(actions_data) > 0:
         actions = np.array(actions_data)
-        # Standardize actions before UMAP
         actions_scaled = StandardScaler().fit_transform(actions)
 
-        # Run UMAP on actions
         reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
         action_embeddings = reducer.fit_transform(actions_scaled)
 
-        # Plot UMAP embeddings colored by Q-values
         sc_actions = ax3.scatter(action_embeddings[:, 0], action_embeddings[:, 1],
                                  c=q_preds, cmap='plasma', alpha=0.6, s=15)
         fig.colorbar(sc_actions, ax=ax3, label='Q-Value')
@@ -439,19 +426,15 @@ def visualize_q_diagnostics(scatter_data, episode_q_mc_sequences, actions_data, 
         ax3.text(0.5, 0.5, 'No action data available', transform=ax3.transAxes, ha='center', va='center')
         ax3.set_title('UMAP of Actions (colored by Q-values)')
 
-    # --- Subplot 4: UMAP of (Actions + Q-values) colored by Q-values ---
     ax4 = axes[3]
     if actions_data is not None and len(actions_data) > 0:
-        # Combine actions and Q-values
         actions = np.array(actions_data)
         combined_features = np.column_stack([actions, q_preds.reshape(-1, 1)])
         combined_scaled = StandardScaler().fit_transform(combined_features)
 
-        # Run UMAP on combined features
         reducer_combined = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
         combined_embeddings = reducer_combined.fit_transform(combined_scaled)
 
-        # Plot UMAP embeddings colored by Q-values
         sc_combined = ax4.scatter(combined_embeddings[:, 0], combined_embeddings[:, 1],
                                   c=q_preds, cmap='plasma', alpha=0.6, s=15)
         fig.colorbar(sc_combined, ax=ax4, label='Q-Value')
@@ -504,12 +487,11 @@ def evaluate_parallel(envs, agent, FLAGS, action_dim, global_steps, actor_fn=Non
     pbar = tqdm.tqdm(total=total_episodes_to_run, desc="Parallel Evaluation", dynamic_ncols=True)
 
     for rollout_idx in range(FLAGS.eval_episodes):
-        # Seed each env distinctly per rollout for diverse, reproducible resets
+        # Seed each env distinctly per rollout for diverse, reproducible resets.
         rollout_seed = global_steps + rollout_idx * FLAGS.n_eval_envs
         raw_observations, _ = envs.reset(seed=rollout_seed)
         observations, obs_images, obs_full_states = _split_obs(raw_observations)
 
-        # Buffers for the current batch
         action_queues = [[] for _ in range(FLAGS.n_eval_envs)]
         rewards_buffers = [[] for _ in range(FLAGS.n_eval_envs)]
         q_preds_buffers = [[] for _ in range(FLAGS.n_eval_envs)]

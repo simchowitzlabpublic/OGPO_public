@@ -57,30 +57,24 @@ def compute_q(critic_fn, critic_params, observations, actions, is_encoded=False,
 
 
 class EXPOAgent(flax.struct.PyTreeNode):
-    """
-    EXpressive Policy Optimization (EXPO) Agent
-    Uses a Flow Matching base policy and a Gaussian Edit policy.
-    """
+    """Expressive Policy Optimization (EXPO): flow matching base policy with a Gaussian edit policy."""
     rng: Any
-    actor_network: TrainState  # Base Policy (Flow)
-    critic_network: TrainState # Q-Function Ensemble
-    edit_network: TrainState   # Edit Policy (Residual)
-    temp: TrainState           # Temperature for Edit Policy SAC objective
+    actor_network: TrainState  # base flow policy
+    critic_network: TrainState # Q-function ensemble
+    edit_network: TrainState   # residual edit policy
+    temp: TrainState           # temperature for the edit-policy SAC objective
     config: Any = nonpytree_field()
 
     def actor_total_loss(self, batch: dict, batch_success: dict,  grad_params: flax.core.FrozenDict, edit_grad_params: flax.core.FrozenDict, success_flag: bool,  rng: jnp.ndarray) -> Tuple[jnp.ndarray, dict]:
-        """ Combined Actor loss: SAC Edit Loss + optional BC Regularization. """
+        """Combined actor loss: SAC edit loss plus optional BC regularization."""
         rng, edit_key, combined_key = jax.random.split(rng, 3)
-        
-        # 1. SAC Edit Loss
+
         sac_loss, sac_info = self.edit_policy_loss(batch, edit_grad_params, edit_key)
-        
-        # 2. Combined BC Regularization (Optional)
+
         bc_loss = 0.0
         bc_info = {'combined_bc_loss': 0.0}
         if self.config.use_bc_regularization:
-            # Use success buffer if available, otherwise fallback to main batch
-            # We must call the loss function inside the branches to avoid pytree mismatch of the batches themselves
+            # Call the loss inside each branch to avoid pytree mismatch of the batches.
             def true_fn(_):
                 return self.bc_loss_combined(batch_success, grad_params, edit_grad_params, combined_key)
             
@@ -110,20 +104,15 @@ class EXPOAgent(flax.struct.PyTreeNode):
         is_encoded: bool = False,
         use_target_critic: bool = True,
     ) -> jnp.ndarray:
-        """ Implements the On-the-Fly (OTF) policy action selection. """
+        """On-the-fly (OTF) policy action selection: sample base actions, edit a subset, pick best by Q."""
         B = observations.shape[0]
         N = self.config.n_action_samples
         M = self.config.n_edit_samples
-        
-        # 1. Sample N actions from Base Policy
+
         rng, key = jax.random.split(rng)
-        
-        # Sample N base actions for each observation
-        # We need to vectorized this. 
-        # observations shape: (B, obs_dim)
-        # repeated_obs shape: (B * N, obs_dim)
-        repeated_obs = jnp.repeat(observations, N, axis=0)
-        
+
+        repeated_obs = jnp.repeat(observations, N, axis=0)  # (B * N, obs_dim)
+
         base_actions, _, _, _ = self.sample_base_actions_with_noise(
             repeated_obs,
             grad_params=actor_params,
@@ -131,14 +120,10 @@ class EXPOAgent(flax.struct.PyTreeNode):
             use_target=True,
             is_encoded=is_encoded
         )
-        # base_actions shape: (B * N, full_act_dim)
-        
-        # 2. Pick M actions to edit
-        # For simplicity, if M > 0, we'll edit the first M samples per batch item or just all N if M=N
+        # base_actions: (B * N, full_act_dim)
+
         if M > 0:
             rng, key = jax.random.split(rng)
-            # Sample edit for first M base actions
-            # We reshape to (B, N, act_dim) to select the first M
             base_actions_reshaped = base_actions.reshape(B, N, -1)
             actions_to_edit = base_actions_reshaped[:, :M, :].reshape(B * M, -1)
             obs_for_edit = jnp.repeat(observations, M, axis=0)
@@ -152,15 +137,13 @@ class EXPOAgent(flax.struct.PyTreeNode):
             edits = edit_dist.sample(seed=key)
             scale = self.config.edit_policy_bound
             edited_actions = actions_to_edit + edits * scale
-            
-            # Combine all candidate actions: (B, N + M, act_dim)
-            all_actions = jnp.concatenate([base_actions_reshaped, edited_actions.reshape(B, M, -1)], axis=1)
+
+            all_actions = jnp.concatenate([base_actions_reshaped, edited_actions.reshape(B, M, -1)], axis=1)  # (B, N + M, act_dim)
             num_candidates = N + M
         else:
             all_actions = base_actions.reshape(B, N, -1)
             num_candidates = N
 
-        # 3. Evaluate all with Critic
         obs_repeated_all = jnp.repeat(observations, num_candidates, axis=0)
         actions_flat_all = all_actions.reshape(B * num_candidates, -1)
         
@@ -178,7 +161,6 @@ class EXPOAgent(flax.struct.PyTreeNode):
         )
         qs = qs.reshape(B, num_candidates)
 
-        # 4. Select Best
         best_indices = jnp.argmax(qs, axis=1)
         batch_indices = jnp.arange(B)
         best_actions = all_actions[batch_indices, best_indices]
@@ -202,7 +184,6 @@ class EXPOAgent(flax.struct.PyTreeNode):
         else:
             actions_chunk = batch["actions"][..., 0, :]
 
-        # Use target networks for next action selection
         next_actions = self._get_otf_actions(
             next_obs,
             next_action_key,
@@ -224,7 +205,6 @@ class EXPOAgent(flax.struct.PyTreeNode):
             subsample_size=self.config.get('num_min_qs', 2),
         )
 
-        # Compute TD target (EXPO uses horizon_length=1)
         target_q = compute_td_target(
             rewards=batch['rewards'],
             masks=batch['masks'],
@@ -233,10 +213,8 @@ class EXPOAgent(flax.struct.PyTreeNode):
             horizon_length=1,
         )
 
-        # Get current Q-values
         current_qs_ensemble = self.critic_network.select('critic')(obs, actions_chunk, params=grad_params)
 
-        # Compute TD loss
         td_loss, _ = compute_td_loss(q_pred=current_qs_ensemble, target_q=target_q, loss_type="mse")
 
         info = {
@@ -252,13 +230,13 @@ class EXPOAgent(flax.struct.PyTreeNode):
         grad_params: flax.core.FrozenDict,
         rng: jnp.ndarray
     ) -> Tuple[jnp.ndarray, dict]:
-        """ SAC-style RL loss for the edit policy. """
+        """SAC-style RL loss for the edit policy."""
         rng, base_key, edit_key = jax.random.split(rng, 3)
 
         obs = batch['observations']
 
-        # Sample base actions from target flow policy (not dataset actions)
-        # so the edit policy trains on the same distribution it sees at inference
+        # Sample base actions from the target flow policy (not dataset actions) so the
+        # edit policy trains on the same distribution it sees at inference.
         base_actions, _, _, _ = self.sample_base_actions_with_noise(
             obs,
             grad_params=self.actor_network.params,
@@ -309,7 +287,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
         edit_grad_params: flax.core.FrozenDict,
         rng: jnp.ndarray
     ) -> Tuple[jnp.ndarray, dict]:
-        """BC loss on combined actions (Flow + Edit Mode) to match dataset actions."""
+        """BC loss on combined (flow + edit mode) actions to match dataset actions."""
         if self.config["action_chunking"]:
             dataset_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
         else:
@@ -346,10 +324,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
         grad_params: flax.core.FrozenDict,
         rng: jnp.ndarray
     ) -> Tuple[jnp.ndarray, dict]:
-        """Standard Flow Matching BC loss for the Base Policy.
-
-        Uses bc_helper for action preprocessing and target generation.
-        """
+        """Flow matching BC loss for the base policy."""
         batch_actions = preprocess_actions(batch, self.config["action_chunking"])
         batch_size = batch_actions.shape[0]
         obs = batch['observations']
@@ -386,24 +361,21 @@ class EXPOAgent(flax.struct.PyTreeNode):
 
     @staticmethod
     def _update(agent, batch_tuple, success_flag) -> Tuple['EXPOAgent', dict]:
-        """ Unified update step for fine-tuning. """
+        """Unified update step for fine-tuning."""
         batch, batch_success = batch_tuple
         new_rng, critic_key, actor_key, base_key = jax.random.split(agent.rng, 4)
 
-        # 1. Update Critic
         def critic_loss_fn(p):
             return agent.critic_loss(batch, p, critic_key)
         new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
 
-        # 2. Update Edit Policy & Combined Regularization
         def actor_loss_fn(p_edit):
             return agent.actor_total_loss(batch, batch_success, agent.actor_network.params, p_edit, success_flag, actor_key)
         new_edit_state, actor_info = agent.edit_network.apply_loss_fn(actor_loss_fn)
 
-        # 3. Update Temperature
         new_temp_state, temp_info = agent.update_temperature(actor_info["edit_entropy"])
 
-        # 4. Update Base Policy (Use success buffer if available, else RL batch)
+        # Update base policy on success buffer if available, else RL batch.
         def base_policy_loss_fn(p):
             def true_fn(_):
                 return agent.bc_loss(batch_success, p, base_key)
@@ -412,7 +384,6 @@ class EXPOAgent(flax.struct.PyTreeNode):
             return jax.lax.cond(success_flag, true_fn, false_fn, None)
         new_actor_state, base_info = agent.actor_network.apply_loss_fn(base_policy_loss_fn)
 
-        # Target updates
         agent.target_update(new_actor_state, 'actor')
         agent.target_update(new_critic_state, 'critic')
 
@@ -433,7 +404,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
             critic_fn=self.critic_network.select('target_critic'),
             observations=observations,
             actions=actions,
-            q_agg="min",  # EXPO always uses min aggregation
+            q_agg="min",
             is_encoded=is_encoded,
         )
 
@@ -453,7 +424,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions(self, observations: jnp.ndarray, rng: jnp.ndarray = None) -> jnp.ndarray:
-        """ Sample actions for environment interaction using the OTF policy. """
+        """Sample actions for environment interaction using the OTF policy."""
         add_batch_dim = False
         if observations.ndim == 1 or (self.config.encoder and observations.ndim == 3):
             add_batch_dim = True
@@ -474,11 +445,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions_BON(self, observations: jnp.ndarray, rng: jnp.ndarray = None) -> jnp.ndarray:
-        """Vectorized Best-of-N for EXPO (N base + M edits, pick best).
-
-        Same as sample_actions but always returns batched output (B, act_dim)
-        for consistency with the runner's BON dispatch.
-        """
+        """Best-of-N action selection; always returns batched output (B, act_dim)."""
         expected_single_ndim = 3 if self.config.encoder else 1
         if observations.ndim == expected_single_ndim:
             observations = observations[None]
@@ -524,7 +491,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
         use_target: bool = True,
         is_encoded: bool = False,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """ Generate actions from the Flow Matching base policy. """
+        """Generate actions from the flow matching base policy."""
         params = grad_params
         actor_module_name = 'target_actor' if use_target else 'actor'
 
@@ -564,10 +531,8 @@ class EXPOAgent(flax.struct.PyTreeNode):
             
             if self.config['clip_intermediate_actions']:
                 curr_actions = jnp.clip(curr_actions, -1.0, 1.0)
-            
-            # Simplified: No intermediate noise for base flow in OGPO/ReinFlow style usually
-            # But EXPO implementation suggests some noise. We'll keep it deterministic for now
-            # unless constant_noise_std is set.
+
+            # Optional injected noise along the flow trajectory.
             if self.config.constant_noise_std > 0:
                 rng, noise_key = jax.random.split(rng)
                 curr_actions += jax.random.normal(noise_key, curr_actions.shape) * self.config.constant_noise_std
@@ -581,7 +546,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
     
     @partial(jax.jit)
     def bc_update(self, batch: dict) -> Tuple['EXPOAgent', dict]:
-        """ Imitation learning update for the base policy. """
+        """Imitation learning update for the base policy."""
         new_rng, base_key = jax.random.split(self.rng)
         
         def base_policy_loss_fn(p):
@@ -596,7 +561,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def batch_update(self, batch: dict, batch_success: dict, success_flag: bool) -> Tuple['EXPOAgent', dict]:
-        """ Batch of online updates. """
+        """Batch of online updates."""
         batch_tuple = (batch, batch_success)
         agent, infos = jax.lax.scan(partial(self._update, success_flag=success_flag), self, batch_tuple)
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
@@ -628,8 +593,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
         action_dim = ex_actions.shape[-1]
         full_act_dim = action_dim * (config.horizon_length if config.action_chunking else 1)
         config['full_act_dim'] = full_act_dim
-        
-        # Initial examples
+
         ex_obs = ex_observations[None, ...]
         ex_full_actions = jnp.tile(ex_actions[None, ...], (1, config.horizon_length if config.action_chunking else 1))
         ex_time = jnp.array([[0.0]])
@@ -640,15 +604,13 @@ class EXPOAgent(flax.struct.PyTreeNode):
             encoders['critic'] = encoder_module()
             encoders['actor'] = encoder_module()
             encoders['edit'] = encoder_module()
-        
-        # Time embedding
+
         time_emb_type = config.get('time_embedding', 'scalar')
         time_emb_module = None
         if time_emb_type == 'sinusoidal':
             time_emb_module = SinusoidalTimeEmbedding(embed_dim=config.get('time_embedding_dim', 32))
 
-        # Two-tier obs encoder (frozen-encoder image runs): see TwoTierObsEncoder.
-        # Mirrors OGPO so the proprio signal isn't drowned in 2048D image features.
+        # Two-tier obs encoder so proprio isn't drowned out by high-dim image features.
         _two_tier_kwargs = dict(
             obs_two_tier=config.get('obs_two_tier', False),
             two_tier_img_dim=config.get('_two_tier_img_dim', 0),
@@ -656,7 +618,6 @@ class EXPOAgent(flax.struct.PyTreeNode):
             two_tier_fused_dim=config.get('two_tier_fused_dim', 0),
         )
 
-        # 1. Base Policy
         actor_def = ActorVectorField(
             hidden_dims=config.actor_hidden_dims,
             action_dim=full_act_dim,
@@ -668,7 +629,6 @@ class EXPOAgent(flax.struct.PyTreeNode):
         actor_nets = {'actor': actor_def, 'target_actor': copy.deepcopy(actor_def)}
         actor_net_def = ModuleDict(actor_nets)
 
-        # 2. Critic
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
@@ -680,7 +640,6 @@ class EXPOAgent(flax.struct.PyTreeNode):
         critic_nets = {'critic': critic_def, 'target_critic': copy.deepcopy(critic_def)}
         critic_net_def = ModuleDict(critic_nets)
 
-        # 3. Edit Policy
         edit_def = EditPolicy(
             hidden_dims=config.edit_hidden_dims,
             action_dim=full_act_dim,
@@ -689,11 +648,9 @@ class EXPOAgent(flax.struct.PyTreeNode):
             layer_norm=config['edit_layer_norm'],
             **_two_tier_kwargs,
         )
-        
-        # 4. Temperature
+
         temp_def = Temperature(config['init_temperature'])
-        
-        # Optimizers - ensure all values are Python floats
+
         clip_grad_norm = float(config.clip_grad_norm)
         def create_tx(lr, wd=0.0):
             return optax.chain(optax.clip_by_global_norm(clip_grad_norm), optax.adamw(float(lr), weight_decay=float(wd)))
@@ -702,8 +659,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
         critic_tx = create_tx(config.critic_lr, config.critic_weight_decay)
         edit_tx = create_tx(config.edit_lr, config['edit_weight_decay'])
         temp_tx = optax.adam(float(config.alpha_lr))
-        
-        # Initialization
+
         rng, actor_key, critic_key, edit_key, temp_key = jax.random.split(rng, 5)
         
         actor_params = actor_net_def.init(actor_key, **{'actor': (ex_obs, ex_full_actions, ex_time), 'target_actor': (ex_obs, ex_full_actions, ex_time)})['params']
@@ -719,8 +675,7 @@ class EXPOAgent(flax.struct.PyTreeNode):
         
         temp_params = temp_def.init(temp_key)['params']
         temp_state = TrainState.create(temp_def, temp_params, temp_tx)
-        
-        # Store dimensions in config
+
         config.ob_dims = ex_obs.shape
         config.action_dim = action_dim
         config.full_act_dim = full_act_dim

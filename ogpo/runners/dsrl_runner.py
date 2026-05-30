@@ -156,10 +156,9 @@ def run_dsrl_online_rl(
     def _maybe_shard(b):
         return shard_batch(b, mesh) if (mesh is not None and b is not None) else b
 
-    # Frozen-encoder plumbing — image envs return dict obs {state, image, full_state}.
-    # The agent's actor/critic was init'd on the encoded [img_feats, proprio] vector
-    # (see main._pre_encode_dataset); we must apply the same encoding to every env
-    # observation before passing it to the agent.
+    # Frozen-encoder plumbing: image envs return dict obs {state, image, full_state}.
+    # The agent was init'd on the encoded [img_feats, proprio] vector, so every env
+    # observation must be encoded the same way before being passed to the agent.
     _use_full_state = config.get('use_state', 'proprio') == 'full'
     _actor_uses_state = config.get('_original_actor_obs', 'state') == 'state'
 
@@ -250,7 +249,7 @@ def run_dsrl_online_rl(
                 total_env_step += 1
                 pbar.update(1)
 
-            # Encode the post-chunk obs once for the transition + next-step start
+            # Encode the post-chunk obs once for both the transition and next step
             next_ob = _encode_ob(raw_next_ob)
 
             reward = max(reward_all)
@@ -338,10 +337,8 @@ def run_dsrl_online_rl(
                     (eval_interval > 0 and total_env_step % eval_interval == 0):
                 eval_step += 1
                 # Wrap the actor with the frozen encoder so the eval loop's raw
-                # dict obs gets folded back into the same encoded vector the
-                # agent was init'd against. Without this, agent.sample_actions
-                # receives 9D proprio vs init'd 2057D and crashes with
-                # ScopeParamShapeError.
+                # dict obs is folded into the encoded vector the agent was init'd
+                # against, else apply raises ScopeParamShapeError.
                 eval_actor_fn = agent.sample_actions
                 if encode_fn is not None:
                     eval_actor_fn = _wrap_actor_for_frozen_encoder(

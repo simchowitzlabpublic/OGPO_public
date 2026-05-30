@@ -71,15 +71,10 @@ def _load_frozen_encoder(encoder_path, agent_config):
 def _pre_encode_dataset(dataset, encode_fn, batch_size=512, agent_config=None):
     """Replace (observations, images) with encoded embeddings in-place.
 
-    `agent_config['use_state']` selects which state vector is concatenated with
-    image features for the encoder + downstream policy/critic:
-      - 'full'    : prefer `full_states` (proprio + object pose, e.g. 23D for square).
-      - 'proprio' : use `observations` (robot proprio only, e.g. 9D for square).
-    Default is 'full' to preserve historical behaviour.
-
-    When `agent_config` is provided, stashes `_two_tier_img_dim` and
-    `_two_tier_proprio_dim` so the two-tier obs encoder auto-sizes its proprio
-    tower to whatever state we picked.
+    `agent_config['use_state']` selects the state vector concatenated with image
+    features: 'full' uses full_states (proprio + object pose), 'proprio' uses the
+    robot proprio only. When provided, stashes the two-tier img/proprio dims so
+    the obs encoder can auto-size its proprio tower.
     """
     n = dataset.size
     imgs = dataset._dict['images']
@@ -102,7 +97,6 @@ def _pre_encode_dataset(dataset, encode_fn, batch_size=512, agent_config=None):
 
     proprio_dim = int(obs.shape[-1])
 
-    # Determine encoded dim from a single sample
     sample_encoded = np.asarray(encode_fn(obs[:1], imgs[:1]))
     encoded_dim = sample_encoded.shape[-1]
     img_feat_dim = encoded_dim - proprio_dim  # encoder concats [img_features, proprio]
@@ -124,7 +118,7 @@ def _pre_encode_dataset(dataset, encode_fn, batch_size=512, agent_config=None):
     dataset._dict['next_observations'] = new_next
     del dataset._dict['images']
     del dataset._dict['next_images']
-    # full_states are no longer separately needed — they're folded into observations
+    # full_states are now folded into the encoded observations
     if has_full:
         del dataset._dict['full_states']
         del dataset._dict['next_full_states']
@@ -191,7 +185,7 @@ def main():
             post_success_steps=env_config.get("post_success_steps", 0),
         )
 
-    del val_dataset  # Not used; free immediately to save RAM
+    del val_dataset  # free immediately to save RAM
 
     n_eval_envs = eval_config["n_eval_envs"]
     eval_envs = None
@@ -237,8 +231,7 @@ def main():
     )
     train_dataset.p_aug = dataset_config["p_aug"]
 
-    # === Early freeze: load frozen encoder and pre-encode dataset BEFORE agent creation ===
-    # Save original actor/critic obs before any frozen encoder overrides (for mixed obs mode)
+    # Save original actor/critic obs before any frozen-encoder overrides (mixed obs mode)
     agent_config['_original_actor_obs'] = agent_config.get('actor_obs', 'state')
     agent_config['_original_critic_obs'] = agent_config.get('critic_obs', 'state')
 
@@ -248,8 +241,7 @@ def main():
 
     if is_paligemma and agent_config.get('freeze_vision_encoder', False):
         # PaliGemma frozen VL encoder: SigLIP vision tower + Gemma LM trunk from
-        # a Pi0/Pi0.5 checkpoint (default: base pi05_base, not the LIBERO-finetuned
-        # variant). The LM trunk runs per-task instructions from ROBOMIMIC_PROMPTS.
+        # a Pi0/Pi0.5 checkpoint. The LM trunk runs per-task instructions.
         from ogpo.networks.encoders.paligemma import load_paligemma_encoder
         paligemma_ckpt = restore_encoder_path if (restore_encoder_path and restore_encoder_path != "None") \
             else os.path.expanduser("~/checkpoints/pi05_base/params")
@@ -268,7 +260,7 @@ def main():
         )
 
         if 'images' in train_dataset._dict:
-            # Batch size 32 for PaliGemma (SigLIP is large; 512 causes OOM)
+            # Small batch for PaliGemma (SigLIP is large; 512 causes OOM)
             _pre_encode_dataset(train_dataset, encode_fn, batch_size=32, agent_config=agent_config)
             print(f"  Pre-encoded {train_dataset.size} observations. "
                   f"New obs dim: {train_dataset['observations'].shape[-1]}")
@@ -283,7 +275,6 @@ def main():
         print(f"Loading frozen encoder from {restore_encoder_path}")
         encode_fn = _load_frozen_encoder(restore_encoder_path, agent_config)
 
-        # Pre-encode dataset: observations become embeddings, images removed
         if 'images' in train_dataset._dict:
             _pre_encode_dataset(train_dataset, encode_fn, agent_config=agent_config)
             print(f"  Pre-encoded {train_dataset.size} observations. "
@@ -334,7 +325,6 @@ def main():
         prefixes.append("online_agent")
     if algo_name in ["ogpo", "reinflow_calql"]:
         prefixes.extend(["eval_sde", "step_data"])
-    # Add eval_one_step prefix if one-step policy is enabled
     if agent_config.get('use_one_step_policy', False):
         prefixes.append("eval_one_step")
     if train_config.get("q_warmup_steps", 0) > 0 and not bc_only:
@@ -354,7 +344,6 @@ def main():
         config=config,
     )
 
-    # Checkpoint loading
     is_resumed = False
     resumed_step = 0
     resumed_online_step = 0
@@ -388,7 +377,6 @@ def main():
             agent.restore_critic_params(restore_critic_path)
             print(f"Restored critic from {restore_critic_path}")
 
-    # BC Training
     ep_resume = checkpoint_config["ep_resume"]
     log_step = ep_resume if not is_resumed else resumed_step
     bc_pi_steps = train_config["bc_pi_steps"]
@@ -429,7 +417,6 @@ def main():
             f"BC Training Complete. Final success rate: {eval_info.get('success', 'N/A')}"
         )
 
-    # BC-Q Training Phase (critic with TD + MC regression on offline data)
     bc_q_steps = train_config["bc_q_steps"]
     if not is_resumed and bc_q_steps > 0 and algo_name in ["ogpo", "reinflow_calql"]:
         print("\n" + "=" * 60 + "\nBC-Q Training Phase\n" + "=" * 60)
@@ -459,7 +446,6 @@ def main():
             mesh=mesh,
         )
 
-    # CalQL Phase
     calql_steps = train_config["calql_steps"]
     if not is_resumed and calql_steps > 0 and algo_name in ["ogpo", "reinflow_calql"]:
         print("\n" + "=" * 60 + "\nCalQL Training Phase\n" + "=" * 60)
@@ -496,9 +482,8 @@ def main():
         eval_flags = _build_eval_flags(
             n_eval_envs, eval_config["eval_episodes"], discount, run_name, env_name
         )
-        # Match the runner-side wrap: pass actor_uses_state + use_full_state
-        # from agent_config so the encoder feeds the same proprio width that
-        # the dataset was pre-encoded with (else ScopeParamShapeError on apply).
+        # Feed the encoder the same proprio width the dataset was pre-encoded with,
+        # else apply raises ScopeParamShapeError.
         _actor_uses_state = agent_config.get('_original_actor_obs', 'state') == 'state'
         _use_full_state = agent_config.get('use_state', 'proprio') == 'full'
         sde_actor_fn = None
@@ -527,14 +512,10 @@ def main():
         except Exception:
             pass
 
-        # Evaluate one-step policy if enabled
         if agent_config.get('use_one_step_policy', False):
-            # Use BON version if best_of_n > 1
             one_step_actor_fn = agent.sample_actions_one_step_BON if best_of_n > 1 else agent.sample_actions_one_step
             # Frozen-encoder runs: wrap so env-raw obs gets re-encoded to the dim
-            # the one-step MLP was init'd with (see online_rl_runner._wrap_actor_for_frozen_encoder).
-            # Pass actor_uses_state + use_full_state so encoder picks the same
-            # proprio width the dataset was pre-encoded with.
+            # the one-step MLP was init'd with.
             if encode_fn is not None:
                 from ogpo.runners.online_rl_runner import _wrap_actor_for_frozen_encoder
                 one_step_actor_fn = _wrap_actor_for_frozen_encoder(
@@ -571,30 +552,25 @@ def main():
         print("\nBC training complete. Starting online RL phase.")
         save_agent(agent, save_dir, log_step)
 
-    # Log finetuning flow steps if different from full chain
     ft_flow_steps = agent_config.get("ft_flow_steps", 0)
     if 0 < ft_flow_steps < agent_config["flow_steps"]:
         print(f"RL finetuning: IS ratio computed over last {ft_flow_steps}/{agent_config['flow_steps']} flow steps")
 
     print("\n" + "=" * 60 + "\nOnline RL Phase\n" + "=" * 60)
 
-    # === Freeze vision encoder if configured ===
-    # Mode 1 (early freeze): encode_fn already set from restore_encoder_path above
-    # Mode 2 (late freeze): freeze after BC training, extract encoder from trained agent
+    # Late freeze: freeze after BC training, extracting the encoder from the
+    # trained agent (early freeze already set encode_fn from restore_encoder_path).
     if encode_fn is None and agent_config.get('freeze_vision_encoder', False) and agent_config.get('encoder'):
         print("Freezing vision encoder and pre-encoding observations...")
         encode_fn = agent.create_frozen_encode_fn()
 
-        # Pre-encode offline dataset in-place
         if train_dataset is not None and 'images' in train_dataset._dict:
             _pre_encode_dataset(train_dataset, encode_fn)
             print(f"  Pre-encoded {train_dataset.size} observations. "
                   f"New obs dim: {train_dataset['observations'].shape[-1]}")
 
-        # Mark encoder as frozen in agent config (shared dict reference)
         agent.config['_encoder_frozen'] = True
 
-    # Common kwargs shared by both runners
     runner_kwargs = dict(
         agent=agent,
         env=env,

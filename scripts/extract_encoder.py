@@ -19,7 +19,7 @@ def extract_encoder(checkpoint_path: str, output_path: str):
 
     agent_dict = ckpt['agent']
 
-    # Format 1: actor_network (from OGPO/BPTT full training)
+    # OGPO/BPTT full-training checkpoint.
     if 'actor_network' in agent_dict:
         params = agent_dict['actor_network']['params']
         if 'modules_actor' in params and 'encoder' in params['modules_actor']:
@@ -27,7 +27,7 @@ def extract_encoder(checkpoint_path: str, output_path: str):
         else:
             raise ValueError("No encoder found in modules_actor")
 
-    # Format 2: network with modules_actor_bc_flow_encoder (from BC-only pretraining)
+    # BC-only pretraining checkpoint.
     elif 'network' in agent_dict:
         params = agent_dict['network']['params']
         if 'modules_actor_bc_flow_encoder' in params:
@@ -40,7 +40,6 @@ def extract_encoder(checkpoint_path: str, output_path: str):
     with open(output_path, 'wb') as f:
         pickle.dump(encoder_params, f)
 
-    # Print summary
     import jax
     num_params = sum(x.size for x in jax.tree.leaves(encoder_params))
     print(f"Extracted encoder: {num_params:,} parameters")

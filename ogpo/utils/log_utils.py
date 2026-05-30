@@ -49,18 +49,10 @@ def get_exp_name(seed):
 
 
 def get_flag_dict(config=None):
-    """Return the dictionary of config for logging.
-
-    Args:
-        config: Configuration dict/AttrDict to convert. If None, returns empty dict.
-
-    Returns:
-        Dictionary representation of the config.
-    """
+    """Return the config as a plain dict for logging (empty dict if None)."""
     if config is None:
         return {}
 
-    # Convert AttrDict or nested dict to plain dict
     def to_dict(obj):
         if hasattr(obj, 'to_dict'):
             return obj.to_dict()
@@ -84,18 +76,7 @@ def setup_wandb(
     id=None,
     resume=None,
 ):
-    """Set up Weights & Biases for logging.
-
-    Args:
-        entity: WandB entity (team/user).
-        project: WandB project name.
-        group: WandB run group.
-        name: WandB run name.
-        mode: WandB mode ('online', 'offline', 'disabled').
-        config: Configuration dict to log.
-        id: WandB run ID (for resuming).
-        resume: Resume mode ('allow', 'must', 'never', etc.).
-    """
+    """Set up Weights & Biases for logging."""
     wandb_output_dir = tempfile.mkdtemp()
     tags = [group] if group is not None else None
 
@@ -133,7 +114,6 @@ def reshape_video(v, n_cols=None):
     _, t, h, w, c = v.shape
 
     if n_cols is None:
-        # Set n_cols to the square root of the number of videos.
         n_cols = np.ceil(np.sqrt(v.shape[0])).astype(int)
     if v.shape[0] % n_cols != 0:
         len_addition = n_cols - v.shape[0] % n_cols
@@ -148,20 +128,13 @@ def reshape_video(v, n_cols=None):
 
 
 def get_wandb_video(renders=None, n_cols=None, fps=15):
-    """Return a Weights & Biases video.
-
-    It takes a list of videos and reshapes them into a single video with the specified number of columns.
-
-    Args:
-        renders: List of videos. Each video should be a numpy array of shape (t, h, w, c).
-        n_cols: Number of columns for the reshaped video. If None, it is set to the square root of the number of videos.
-    """
+    """Reshape a list of (t, h, w, c) videos into a single tiled wandb.Video."""
     # Pad videos to the same length.
     max_length = max([len(render) for render in renders])
     for i, render in enumerate(renders):
         assert render.dtype == np.uint8
 
-        # Decrease brightness of the padded frames.
+        # Dim the padded frames so they are visually distinct.
         final_frame = render[-1]
         final_image = Image.fromarray(final_frame)
         enhancer = ImageEnhance.Brightness(final_image)
@@ -171,7 +144,6 @@ def get_wandb_video(renders=None, n_cols=None, fps=15):
         pad = np.repeat(final_frame[np.newaxis, ...], max_length - len(render), axis=0)
         renders[i] = np.concatenate([render, pad], axis=0)
 
-        # Add borders.
         renders[i] = np.pad(renders[i], ((0, 0), (1, 1), (1, 1), (0, 0)), mode='constant', constant_values=0)
     renders = np.array(renders)  # (n, t, h, w, c)
 

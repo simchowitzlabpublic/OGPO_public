@@ -32,13 +32,8 @@ from ogpo.agents.modules.pg_helper import (
 )
 
 class DSRLEXPOAgent(flax.struct.PyTreeNode):
-    """Soft Actor-Critic (SAC) noise agent + base flow matching actor agent with Best-of-N sampling.
-    Uses separate TrainState objects for actor, critic, and BC flow networks.
-
-    DSRL+EXPO Extension:
-    - action_critic_network: Evaluates Q(obs, refined_action) for training edit actor
-    - edit_actor_network: Refines flow-refined actions with learned edits
-    """
+    """DSRL+EXPO: SAC noise policy over a frozen flow-matching actor, with Best-of-N
+    sampling and a learned edit actor that refines flow-refined actions."""
 
     rng: Any
     actor_network: TrainState  # SAC actor + temperature (noise policy)
@@ -46,7 +41,6 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
     bc_flow_network: TrainState  # Flow matching actor (frozen in online RL)
     noise_critic_network: TrainState  # Distilled critic operating in noise space
 
-    # DSRL+EXPO components
     action_critic_network: TrainState  # Q_action: Critic + target critic (evaluates final actions)
     edit_actor_network: TrainState  # Edit policy + temperature
 
@@ -85,40 +79,34 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         return self._denoise_noise_batch(observations, scaled_noise)
 
     def critic_loss(self, batch, grad_params, rng):
-        """Compute the SAC critic loss (standard single-sample TD target).
+        """SAC critic loss with a single-sample TD target.
 
-        Matches original DSRL: sample ONE noise from actor, denoise → action,
-        evaluate target_critic. No Best-of-N for TD targets (BoN causes
-        maximization bias → Q-value explosion).
+        Uses one noise sample per transition (Best-of-N TD targets cause
+        maximization bias and Q-value explosion).
         """
         rng, sample_rng = jax.random.split(rng)
         next_dist = self.actor_network.select('actor')(batch['next_observations'])
 
-        # Sample single noise from actor, scale + denoise → action
         next_noise = next_dist.sample(seed=sample_rng)
         next_actions = self.noise_to_actions(batch['next_observations'], next_noise)
 
-        # Evaluate Q-values with target critic
         next_qs = self.critic_network.select('target_critic')(
             batch['next_observations'], actions=next_actions
         )
 
-        # Aggregate Q-values across ensemble
         rng, agg_rng = jax.random.split(rng)
         next_q = aggregate_q_values(
             next_qs, method=self.config['q_agg'],
             rng=agg_rng, num_qs=self.config['num_qs'],
         )
 
-        # Get temperature for entropy bonus
         temp = self.actor_network.select('temp')()
 
-        # Compute TD target with optional entropy backup
         if self.config['entropy_backup']:
             # Entropy is computed in noise space (the policy's action space)
             next_log_probs = jnp.clip(next_dist.log_prob(next_noise), -100, 100)
             next_q_with_entropy = next_q - temp * next_log_probs
-            # horizon_length=1: DSRL stores chunk-level transitions (match reference)
+            # horizon_length=1: transitions are stored at chunk level
             target_q = compute_td_target(
                 rewards=batch['rewards'],
                 masks=batch['masks'],
@@ -139,11 +127,10 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
                 clip_max=500.0,
             )
 
-        # Current Q-values (critic operates on denoised actions, NOT noise)
-        # batch["true_actions"] = flattened executed actions; batch["actions"] = noise
+        # Critic operates on denoised actions, not noise: true_actions are the
+        # flattened executed actions, batch["actions"] holds the noise.
         q = self.critic_network.select('critic')(batch['observations'], actions=batch["true_actions"], params=grad_params)
 
-        # MSE loss
         critic_loss, _ = compute_td_loss(q_pred=q, target_q=target_q, loss_type="mse")
 
         info = {
@@ -167,29 +154,25 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         return critic_loss, info
 
     def actor_loss(self, batch, grad_params, rng):
-        """Compute the SAC actor loss with integrated temperature loss.
+        """SAC actor loss with integrated temperature loss.
 
-        Uses the noise critic (distilled from main critic) to evaluate noise actions,
-        avoiding the semantic mismatch of feeding noise to an action-trained critic.
+        Evaluates noise actions with the noise critic (distilled from the main critic)
+        to avoid feeding noise to an action-trained critic.
         """
-        # Sample noise with current policy
         rng, sample_rng = jax.random.split(rng)
         dist = self.actor_network.select('actor')(batch['observations'], params=grad_params)
         actions, log_probs = dist.sample_and_log_prob(seed=sample_rng)
-        # Safety: clip log_probs to prevent overflow when policy becomes deterministic
+        # Clip log_probs to prevent overflow when policy becomes deterministic
         log_probs = jnp.clip(log_probs, -100, 100)
 
-        # Get Q-values from noise critic (operates in noise space)
         qs = self.noise_critic_network.select('noise_critic')(batch['observations'], actions=actions)
         if self.config['q_agg'] == 'min':
             q = jnp.min(qs, axis=0)
         else:
             q = jnp.mean(qs, axis=0)
-        
-        # Get temperature
+
         temp = self.actor_network.select('temp')()
-        
-        # SAC actor loss: maximize Q - temperature * entropy
+
         actor_loss = jnp.mean((temp * log_probs - q))
 
         temp_param = self.actor_network.select('temp')(params=grad_params)
@@ -216,38 +199,21 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         return a_loss, info
     
     def actor_bc_loss(self, batch, grad_params, rng):
-        """Compute BC loss on actor network using successful noise samples.
+        """BC loss training the actor to imitate noise from the success buffer.
 
-        The success buffer contains transitions where batch["actions"] is the noise
-        that led to successful outcomes. We train the actor to imitate this successful noise.
-
-        Uses MSE loss between actor output and successful noise to avoid issues with
-        computing log_prob on tanh-transformed distributions.
-
-        Args:
-            batch: Batch with successful transitions where batch["actions"] contains noise
-            grad_params: Parameters for gradient computation
-            rng: Random number generator
-
-        Returns:
-            Weighted BC loss and info dict
+        Uses MSE between actor output and successful noise (in batch["actions"]) to
+        avoid computing log_prob on tanh-transformed distributions.
         """
-        # batch["actions"] contains the noise that led to successful outcomes (tanh-squashed)
         successful_noise = batch["actions"]
 
-        # Get distribution from current actor
         dist = self.actor_network.select('actor')(batch['observations'], params=grad_params)
 
-        # Get the mode/mean of the distribution (already tanh-squashed)
         if hasattr(dist, 'mode'):
             actor_noise = dist.mode()
         else:
             actor_noise = dist.mean()
 
-        # Compute MSE loss between actor output and successful noise
         bc_loss_unweighted = jnp.mean(jnp.square(actor_noise - successful_noise))
-
-        # Apply bc_coeff weighting
         bc_loss = self.config["bc_coeff"] * bc_loss_unweighted
 
         return bc_loss, {
@@ -261,39 +227,31 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         }
 
     def noise_critic_distill_loss(self, batch, grad_params, rng):
-        """Distill main critic's knowledge into noise critic.
+        """Distill the main critic into the noise critic.
 
-        Trains noise_critic(obs, normalized_noise) ≈ critic(obs, denoise(scaled_noise)).
-        Matches reference DSRL: noise is normalized to [-1,1] for noise_critic,
-        scaled by action_magnitude for diffusion.
+        Trains noise_critic(obs, normalized_noise) ≈ critic(obs, denoise(scaled_noise)),
+        with noise normalized to [-1,1] for the noise critic and scaled by
+        action_magnitude for diffusion.
         """
         batch_size = batch['observations'].shape[0]
         noise_dim = self.config['noise_dim']
 
-        # 1. Sample random noise (broad coverage, not from actor)
+        # Sample random noise for broad coverage (not from the actor)
         rng, noise_rng = jax.random.split(rng)
         raw_noise = jax.random.normal(noise_rng, (batch_size, noise_dim))
 
-        # 2. Normalize to [-1, 1] (match actor's tanh output distribution)
+        # Normalize to [-1, 1] to match the actor's tanh output distribution
         normalized_noise = self._normalize_noise_for_critic(raw_noise)
-
-        # 3. Scale for diffusion input (match reference's unscale_action)
         scaled_noise = self._scale_noise_for_diffusion(normalized_noise)
-
-        # 4. Denoise via frozen BC flow → real actions
         denoised_actions = self._denoise_noise_batch(batch['observations'], scaled_noise)
 
-        # 5. Q targets from main critic (stop gradient)
         target_qs = jax.lax.stop_gradient(
             self.critic_network.select('critic')(batch['observations'], actions=denoised_actions)
         )
-
-        # 6. Noise critic prediction on NORMALIZED noise ([-1, 1] range)
         pred_qs = self.noise_critic_network.select('noise_critic')(
             batch['observations'], actions=normalized_noise, params=grad_params
         )
 
-        # 7. MSE distillation loss
         distill_loss = jnp.mean((pred_qs - target_qs) ** 2)
 
         return distill_loss, {
@@ -315,11 +273,7 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         return c_loss, info
 
     def bc_loss(self, batch, grad_params, rng):
-        """Compute the Flow Matching actor loss for offline pretraining.
-
-        Uses 'valid' mask from offline dataset.
-        Uses bc_helper for standard flow matching BC loss computation.
-        """
+        """Flow matching actor loss for offline pretraining (uses the 'valid' mask)."""
         batch_actions = preprocess_actions(batch, self.config["action_chunking"])
         batch_size = batch_actions.shape[0]
 
@@ -343,11 +297,10 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         }
 
     def bc_loss_online(self, batch, grad_params, rng):
-        """Compute the Flow Matching actor loss for online RL success buffer.
+        """Flow matching actor loss for the online RL success buffer.
 
-        Uses bc_coeff weighting and treats all timesteps as valid.
-        Note: batch["actions"] contains noise, batch["true_actions"] contains actual executed actions.
-        Uses bc_helper for online BC loss computation.
+        Uses bc_coeff weighting and treats all timesteps as valid. batch["true_actions"]
+        holds the executed actions (batch["actions"] holds noise).
         """
         def model_fn(obs, x_t, t):
             return self.bc_flow_network.select('actor_bc_flow')(obs, x_t, t, params=grad_params)
@@ -361,36 +314,20 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             action_key="true_actions"
         )
 
-    # ========== DSRL+EXPO: Action Critic and Edit Actor Methods ==========
-
     def action_critic_loss(self, batch, grad_params, rng):
-        """Compute the action critic loss for DSRL+EXPO.
-
-        This critic evaluates Q(obs, refined_action) where refined_action is the
-        final action after flow refinement and optional edit.
-
-        Args:
-            batch: Must contain 'refined_actions' field with final executed actions
-            grad_params: Parameters for gradient computation
-            rng: Random number generator
-
-        Returns:
-            Tuple of (loss, info_dict)
-        """
-        # Check if edit actor is enabled
+        """Action critic loss: evaluates Q(obs, refined_action) on final actions
+        after flow refinement and optional edit. Requires batch['refined_actions']."""
         if not self.config['use_edit_actor']:
             return 0.0, {}
 
-        # Sample next actions: noise → flow → (optionally edit)
+        # Sample next actions: noise -> flow -> (optionally edit)
         rng, sample_rng = jax.random.split(rng)
         next_dist = self.actor_network.select('actor')(batch['next_observations'])
 
-        # Sample num_action_samples noise samples
         batch_size = batch['next_observations'].shape[0]
         sample_keys = jax.random.split(sample_rng, self.config["num_action_samples"])
         next_noises = jnp.stack([next_dist.sample(seed=key) for key in sample_keys], axis=0)
 
-        # Apply flow refinement to get base actions
         if self.config["noise_chunk_length"] > 0:
             next_noises_expanded = jnp.tile(
                 next_noises, self.config["horizon_length"]
@@ -398,11 +335,10 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         else:
             next_noises_expanded = next_noises
 
-        # Scale noise by action_magnitude before diffusion (match reference DSRL)
+        # Scale noise by action_magnitude before diffusion
         next_noises_scaled = self._scale_noise_for_diffusion(next_noises_expanded)
 
-        # Compute flow-refined actions for all samples
-        # Shape: (num_samples, batch_size, action_dim)
+        # Flow-refined actions for all samples: (num_samples, batch_size, action_dim)
         batch_next_obs = jnp.repeat(
             batch['next_observations'][None, ...],
             self.config["num_action_samples"],
@@ -413,27 +349,21 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             in_axes=(0, 0)
         )(batch_next_obs, next_noises_scaled)
 
-        # Apply edit actor if we're past edit_start_step
         n_edit_samples = self.config['n_edit_samples']
         if n_edit_samples > 0:
-            # Sample edits for a subset of base actions
             rng, edit_rng = jax.random.split(rng)
-            # Take first n_edit_samples for editing
             edit_base_actions = next_base_actions[:n_edit_samples]
             edit_obs = batch_next_obs[:n_edit_samples]
 
-            # Sample edits from edit actor using vmap for both distribution creation and sampling
             edit_keys = jax.random.split(edit_rng, n_edit_samples)
-            
-            # Vmap both distribution creation AND sampling together
+
             def sample_edit(obs, base_act, key):
                 edit_dist = self.edit_actor_network.select('edit_actor')(obs, base_act)
                 return edit_dist.sample(seed=key)
-            
+
             edits = jax.vmap(sample_edit)(edit_obs, edit_base_actions, edit_keys)
             edited_actions = edit_base_actions + edits
 
-            # Combine: original base actions + edited actions
             next_refined_actions = jnp.concatenate([next_base_actions, edited_actions], axis=0)
             batch_next_obs_all = jnp.concatenate([
                 batch_next_obs,
@@ -443,12 +373,10 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             next_refined_actions = next_base_actions
             batch_next_obs_all = batch_next_obs
 
-        # Evaluate all refined actions with target action critic
         next_qs_all = self.action_critic_network.select('target_action_critic')(
             batch_next_obs_all, actions=next_refined_actions
         )
 
-        # Aggregate Q-values across ensemble
         rng, agg_rng = jax.random.split(rng)
         next_qs_all = aggregate_q_values(
             next_qs_all, method=self.config['q_agg'],
@@ -459,7 +387,7 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         best_idx = jnp.argmax(next_qs_all, axis=0)
         next_q = jnp.take_along_axis(next_qs_all, best_idx[None, :], axis=0).squeeze(0)
 
-        # Compute TD target (horizon_length=1: chunk-level transitions, match reference)
+        # horizon_length=1: transitions are stored at chunk level
         target_q = compute_td_target(
             rewards=batch['rewards'],
             masks=batch['masks'],
@@ -470,14 +398,12 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             clip_max=500.0,
         )
 
-        # Current Q-values on refined actions
         q = self.action_critic_network.select('action_critic')(
             batch['observations'],
             actions=batch["refined_actions"],
             params=grad_params
         )
 
-        # MSE loss
         action_critic_loss, _ = compute_td_loss(q_pred=q, target_q=target_q, loss_type="mse")
 
         info = {
@@ -491,29 +417,16 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         return action_critic_loss, info
 
     def edit_actor_loss(self, batch, grad_params, rng):
-        """Compute the edit actor loss for DSRL+EXPO.
-
-        The edit actor learns to refine flow-refined actions by maximizing
+        """Edit actor loss: learns to refine flow actions by maximizing
         Q_action(obs, base_action + edit) - temperature * entropy.
 
-        Uses base_actions from replay buffer (off-policy) to match EXPO's approach.
-
-        Args:
-            batch: Training batch (must contain 'base_actions' field)
-            grad_params: Parameters for gradient computation
-            rng: Random number generator
-
-        Returns:
-            Tuple of (loss, info_dict)
+        Uses off-policy base_actions from the replay buffer (requires batch['base_actions']).
         """
-        # Check if edit actor is enabled
         if not self.config['use_edit_actor']:
             return 0.0, {}
 
-        # Use base actions from replay buffer (off-policy, like EXPO)
         base_actions = batch['base_actions']
 
-        # Sample edits from edit actor
         rng, edit_rng = jax.random.split(rng)
         edit_dist = self.edit_actor_network.select('edit_actor')(
             batch['observations'],
@@ -522,26 +435,21 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         )
         edits, log_probs = edit_dist.sample_and_log_prob(seed=edit_rng)
 
-        # Apply edits to base actions
         refined_actions = base_actions + edits
 
-        # Evaluate with action critic
         qs = self.action_critic_network.select('action_critic')(
             batch['observations'],
             actions=refined_actions
         )
 
-        # Aggregate Q-values across ensemble
         rng, agg_rng = jax.random.split(rng)
         q = aggregate_q_values(
             qs, method=self.config['q_agg'],
             rng=agg_rng, num_qs=self.config.get('action_num_qs', self.config['num_qs']),
         )
 
-        # Get temperature
         edit_temp = self.edit_actor_network.select('edit_temp')()
 
-        # Edit actor loss: maximize Q - temperature * entropy
         edit_actor_loss = jnp.mean((edit_temp * log_probs - q))
 
         temp_param = self.edit_actor_network.select('edit_temp')(params=grad_params)
@@ -594,13 +502,12 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         """Apply gradient update to actor, critic, and noise critic networks (online RL)."""
         new_rng, rng1, rng2, rng3 = jax.random.split(agent.rng, 4)
 
-        # Update critic network (trained on real actions from replay)
         def critic_loss_fn(p):
             return agent.critic_total_loss(batch, p, rng2)
         new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
         agent.target_update(new_critic_state, 'critic')
 
-        # Multi-step noise critic distillation (use updated critic for targets)
+        # Multi-step noise critic distillation against the updated critic
         noise_critic_grad_steps = int(agent.config.get('noise_critic_grad_steps', 1))
         agent_for_nc = agent.replace(critic_network=new_critic_state)
         current_nc_state = agent.noise_critic_network
@@ -611,14 +518,12 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             current_nc_state, nc_info = current_nc_state.apply_loss_fn(nc_loss_fn)
         new_noise_critic_state = current_nc_state
 
-        # Update actor network (uses updated noise critic for Q-values)
         def actor_loss_fn(p):
             return agent.replace(
                 noise_critic_network=new_noise_critic_state
             ).actor_total_loss(batch, p, rng1)
         new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
 
-        # Combine info
         info = {**actor_info, **critic_info, **nc_info}
 
         return agent.replace(
@@ -637,8 +542,8 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         new_rng, rng1 = jax.random.split(agent.rng, 2)
         
         def bc_loss_fn(p):
-            return agent.bc_loss(batch, p, rng1)  # Offline BC loss (with 'valid' mask)
-        
+            return agent.bc_loss(batch, p, rng1)
+
         new_bc_flow_state, info = agent.bc_flow_network.apply_loss_fn(bc_loss_fn)
         
         return agent.replace(bc_flow_network=new_bc_flow_state, rng=new_rng), info
@@ -652,25 +557,20 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         agent,
         batch_tuple: Tuple[dict, dict, bool]
     ) -> Tuple['DSRLEXPOAgent', dict]:
-        """Apply gradient update to actor (with BC on success buffer), critic, and noise critic.
+        """Online update of actor (with BC on the success buffer), critic, and noise critic.
 
-        The BC flow network is NOT updated during online RL - it remains frozen after
-        offline pretraining. Only the actor (noise policy) is adapted using successful
-        noise samples from the success buffer.
-
-        DSRL+EXPO Extension:
-        If use_edit_actor is enabled, also updates action_critic and edit_actor.
+        The BC flow network stays frozen after offline pretraining. If use_edit_actor
+        is enabled, also updates the action critic and edit actor.
         """
         batch, batch_success, success_flag = batch_tuple
         new_rng, rng1, rng2, rng3, rng4, rng5, rng6 = jax.random.split(agent.rng, 7)
 
-        # Update critic network (trained on real actions from replay)
         def critic_loss_fn(p):
             return agent.critic_total_loss(batch, p, rng2)
         new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
         agent.target_update(new_critic_state, 'critic')
 
-        # Multi-step noise critic distillation (use updated critic for targets)
+        # Multi-step noise critic distillation against the updated critic
         noise_critic_grad_steps = int(agent.config.get('noise_critic_grad_steps', 1))
         agent_for_nc = agent.replace(critic_network=new_critic_state)
         current_nc_state = agent.noise_critic_network
@@ -681,20 +581,17 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             current_nc_state, nc_info = current_nc_state.apply_loss_fn(nc_loss_fn)
         new_noise_critic_state = current_nc_state
 
-        # Update actor network with RL loss + optional BC loss on successful noise
         agent_for_actor = agent.replace(noise_critic_network=new_noise_critic_state)
         def actor_loss_fn(p):
-            # RL loss on regular batch (uses updated noise critic)
             rl_loss, rl_info = agent_for_actor.actor_total_loss(batch, p, rng1)
 
-            # Conditionally add BC loss on success batch
             def add_bc_loss():
                 bc_loss, bc_info = agent.actor_bc_loss(batch_success, p, rng3)
                 combined_info = {**rl_info, **bc_info}
                 return rl_loss + bc_loss, combined_info
 
             def no_bc_loss():
-                # Add dummy BC metrics for consistent logging
+                # Dummy BC metrics for consistent logging
                 dummy_bc_info = {
                     'actor_bc_loss': 0.0,
                     'actor_bc_loss_unweighted': 0.0,
@@ -710,9 +607,7 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
 
         new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
 
-        # DSRL+EXPO: Update action critic and edit actor if enabled
         if agent.config['use_edit_actor'] and agent.action_critic_network is not None:
-            # Update action critic network (Q_action)
             def action_critic_loss_fn(p):
                 return agent.action_critic_total_loss(batch, p, rng4)
             new_action_critic_state, action_critic_info = agent.action_critic_network.apply_loss_fn(
@@ -720,14 +615,12 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             )
             agent.target_update(new_action_critic_state, 'action_critic')
 
-            # Update edit actor network
             def edit_actor_loss_fn(p):
                 return agent.edit_actor_total_loss(batch, p, rng5)
             new_edit_actor_state, edit_actor_info = agent.edit_actor_network.apply_loss_fn(
                 edit_actor_loss_fn
             )
 
-            # Combine all info
             info = {**actor_info, **critic_info, **nc_info, **action_critic_info, **edit_actor_info}
 
             return agent.replace(
@@ -739,7 +632,6 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
                 rng=new_rng
             ), info
         else:
-            # Original DSRL behavior (no edit actor)
             info = {**actor_info, **critic_info, **nc_info}
 
             return agent.replace(
@@ -753,11 +645,8 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
     def batch_update(self, batch, batch_success=None, success_flag=False):
         """Update the agent and return a new agent with information dictionary."""
         if batch_success is None:
-            # Original behavior: only update critic
             agent, infos = jax.lax.scan(self._update, self, batch)
         else:
-            # New behavior: update critic + optionally BC flow on success buffer
-            # For each UTD step, create tuple of (batch, batch_success, success_flag)
             def scan_fn(agent, inputs):
                 batch_i, batch_success_i = inputs
                 return self._update_with_bc(agent, (batch_i, batch_success_i, success_flag))
@@ -772,22 +661,19 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         rng=None,
         deterministic=False,
     ):
-        """Sample best of N noise from the actor policy with BON Q-value selection."""
+        """Sample Best-of-N noise from the actor policy with noise-critic Q-selection."""
         if deterministic:
-            # For deterministic mode, just use mode/mean (no Best-of-N)
             dist = self.actor_network.select('actor')(observations)
             if hasattr(dist, 'mode'):
                 noise = dist.mode()
             else:
                 noise = dist.mean()
         else:
-            # Sample N noises from actor and select best based on noise critic Q-value
             dist = self.actor_network.select('actor')(observations)
             rng, sample_rng = jax.random.split(rng)
             sample_keys = jax.random.split(sample_rng, self.config["num_action_samples"])
             noises = jnp.stack([dist.sample(seed=key) for key in sample_keys], axis=0)  # (num_samples, batch_size, action_dim)
 
-            # Evaluate Q-values using noise critic (operates in noise space)
             batch_obs = jnp.repeat(observations[None, ...], self.config["num_action_samples"], axis=0)
             qs = self.noise_critic_network.select('noise_critic')(batch_obs, actions=noises)  # (num_qs, num_samples, batch_size)
 
@@ -799,10 +685,9 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             else:
                 qs = qs.min(axis=0)  # (num_samples, batch_size)
 
-            # NaN guard: replace NaN Q-values with -inf so they're never selected
+            # Replace NaN Q-values with -inf so they're never selected
             qs = jnp.where(jnp.isnan(qs), -jnp.inf, qs)
 
-            # Best-of-N: select noise with highest Q-value
             best_idx = jnp.argmax(qs, axis=0, keepdims=True)  # (1, batch_size)
             noise = jnp.take_along_axis(noises, best_idx[..., None], axis=0).squeeze(0)  # (batch_size, action_dim)
         return noise
@@ -818,36 +703,22 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
     ):
         """Sample actions from the actor policy with Best-of-N sampling.
 
-        DSRL+EXPO Extension:
-        If use_edit_actor is enabled, also samples edit refinements and evaluates
-        them with the action critic for Best-of-N selection.
-
-        Args:
-            observations: Current observations
-            rng: Random number generator
-            deterministic: If True, use mode/mean instead of sampling
-            return_info: If True, return dict with {actions, base_actions, noise}
-                        If False, return only actions (default, for backward compatibility)
-
-        Returns:
-            If return_info=False: actions (final actions to execute)
-            If return_info=True: dict with 'actions', 'base_actions', 'noise'
+        If use_edit_actor is enabled, also samples edit refinements and evaluates them
+        with the action critic for Best-of-N selection. With return_info=True, returns a
+        dict {actions, base_actions, noise}; otherwise returns the actions to execute.
         """
         dist = self.actor_network.select('actor')(observations)
 
         if deterministic:
-            # For deterministic mode, just use mode/mean (no Best-of-N)
             if hasattr(dist, 'mode'):
                 noises = dist.mode()
             else:
                 noises = dist.mean()
         else:
-            # Sample N actions from actor and select best based on Q-value
             rng, sample_rng = jax.random.split(rng)
             sample_keys = jax.random.split(sample_rng, self.config["num_action_samples"])
             noises = jnp.stack([dist.sample(seed=key) for key in sample_keys], axis=0)  # (num_samples, batch_size, action_dim)
 
-            # Evaluate Q-values using noise critic (operates in noise space)
             batch_obs = jnp.repeat(observations[None, ...], self.config["num_action_samples"], axis=0)
             qs = self.noise_critic_network.select('noise_critic')(batch_obs, actions=noises)  # (num_qs, num_samples, batch_size)
 
@@ -859,46 +730,37 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             else:
                 qs = qs.min(axis=0)  # (num_samples, batch_size)
 
-            # NaN guard: replace NaN Q-values with -inf so they're never selected
+            # Replace NaN Q-values with -inf so they're never selected
             qs = jnp.where(jnp.isnan(qs), -jnp.inf, qs)
 
-            # Best-of-N: select action with highest Q-value
             best_idx = jnp.argmax(qs, axis=0, keepdims=True)  # (1, batch_size)
             noises = jnp.take_along_axis(noises, best_idx[..., None], axis=0).squeeze(0)  # (batch_size, action_dim)
 
-        # Expand noise for action chunking
         if self.config["noise_chunk_length"] > 0:
             assert self.config["noise_chunk_length"] == 1
             noises_expanded = jnp.tile(noises, self.config["horizon_length"])
         else:
             noises_expanded = noises
 
-        # Scale noise by action_magnitude before diffusion (match reference DSRL)
+        # Scale noise by action_magnitude before diffusion
         scaled_noise = self._scale_noise_for_diffusion(noises_expanded)
-        # Apply flow refinement to get base actions
         base_actions = self.compute_flow_actions(observations, scaled_noise)
 
-        # DSRL+EXPO: Apply edit actor if enabled
         if self.config['use_edit_actor'] and self.action_critic_network is not None and not deterministic:
             n_edit_samples = self.config['n_edit_samples']
             if n_edit_samples > 0:
-                # Generate multiple edit refinements
                 rng, edit_rng = jax.random.split(rng)
                 edit_keys = jax.random.split(edit_rng, n_edit_samples)
 
-                # Sample edits for each observation
                 edit_dist = self.edit_actor_network.select('edit_actor')(observations, base_actions)
                 edits = jnp.stack([edit_dist.sample(seed=key) for key in edit_keys], axis=0)  # (n_edit_samples, batch_size, action_dim)
 
-                # Apply edits to base actions
                 # Handle both batched and unbatched base_actions
                 base_actions_expanded = base_actions[None, ...] if base_actions.ndim == 1 else base_actions[None, :, :]
                 edited_actions = base_actions_expanded + edits  # (n_edit_samples, batch_size, action_dim)
 
-                # Combine base actions with edited actions
                 all_actions = jnp.concatenate([base_actions_expanded, edited_actions], axis=0)  # (1 + n_edit_samples, batch_size, action_dim)
 
-                # Evaluate all actions with Q_action
                 batch_obs_all = jnp.repeat(observations[None, ...], 1 + n_edit_samples, axis=0)
                 action_qs = self.action_critic_network.select('target_action_critic')(batch_obs_all, actions=all_actions)
 
@@ -910,12 +772,10 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
                 else:
                     action_qs = action_qs.min(axis=0)
 
-                # NaN guard: replace NaN Q-values with -inf so they're never selected
+                # Replace NaN Q-values with -inf so they're never selected
                 action_qs = jnp.where(jnp.isnan(action_qs), -jnp.inf, action_qs)
 
-                # Select best action
                 best_idx = jnp.argmax(action_qs, axis=0, keepdims=True)
-                # Handle both batched and unbatched cases
                 if action_qs.ndim == 1:
                     # Unbatched: action_qs is (1 + n_edit_samples,), best_idx is (1,)
                     final_actions = jnp.take_along_axis(all_actions, best_idx[:, None], axis=0).squeeze(0)
@@ -943,8 +803,7 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
     def noise_to_actions_public(self, observations, actor_noise):
         """Public API: actor noise [-1,1] -> scale -> denoise -> actions [-1,1].
 
-        Handles unbatched observations (via compute_flow_actions internals).
-        Use this from the runner instead of calling compute_flow_actions directly.
+        Handles unbatched observations; prefer this over compute_flow_actions in runners.
         """
         if self.config["noise_chunk_length"] > 0:
             assert self.config["noise_chunk_length"] == 1
@@ -986,10 +845,10 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         observations,
         noises=None,
         params=None,
-        rng=None,  # Accept rng for compatibility with evaluation code
+        rng=None,  # accepted for compatibility with evaluation code
     ):
-        """Compute actions from the BC flow model using pg_helper ODE function."""
-        # Handle unbatched observations (e.g., from runner's data collection)
+        """Compute actions from the BC flow model via the pg_helper ODE solver."""
+        # Handle unbatched observations (e.g., from runner data collection)
         add_batch_dim = False
         if (self.config['encoder'] is not None and observations.ndim == 3) or \
            (self.config['encoder'] is None and observations.ndim == 1):
@@ -1000,14 +859,12 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
 
         act_dim = self.config['noise_dim']
 
-        # Handle encoder
         if self.config['encoder'] is not None:
             if params is not None:
                 observations = self.bc_flow_network.select('actor_bc_flow_encoder')(observations, params=params)
             else:
                 observations = self.bc_flow_network.select('actor_bc_flow_encoder')(observations)
 
-        # Create wrapper function for actor network
         def actor_fn(obs, actions, t, is_encoded=True):
             if params is not None:
                 return self.bc_flow_network.select('actor_bc_flow')(obs, actions, t, is_encoded=is_encoded, params=params)
@@ -1022,12 +879,11 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             act_dim=act_dim,
             act_min=-1.0,
             act_max=1.0,
-            clip_intermediate=False,  # DSRL+EXPO doesn't clip intermediate actions
+            clip_intermediate=False,
             noises=noises,
             is_encoded=True,
         )
 
-        # Remove batch dimension if it was added
         if add_batch_dim:
             actions = actions[0]
 
@@ -1073,14 +929,7 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         ex_actions,
         config,
     ):
-        """Create a new agent.
-
-        Args:
-            seed: Random seed.
-            ex_observations: Example batch of observations.
-            ex_actions: Example batch of actions.
-            config: Configuration dictionary.
-        """
+        """Create a new agent."""
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -1110,9 +959,8 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             encoders['actor'] = encoder_module()
             encoders['actor_bc_flow'] = encoder_module()
             
-        # Two-tier obs encoder (frozen-encoder image runs): see TwoTierObsEncoder.
-        # Matches OGPO so DSRL+EXPO sees proprio through a dedicated tower
-        # instead of buried inside 2048D image features.
+        # Two-tier obs encoder (frozen-encoder image runs): routes proprio through a
+        # dedicated tower rather than burying it inside image features.
         _two_tier_kwargs = dict(
             obs_two_tier=config.get('obs_two_tier', False),
             two_tier_img_dim=config.get('_two_tier_img_dim', 0),
@@ -1135,27 +983,24 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
 
         actor_def = Actor(
             hidden_dims=config['actor_hidden_dims'],
-            action_dim=noise_dim,  # This handles both chunked and non-chunked actions
+            action_dim=noise_dim,
             layer_norm=config['actor_layer_norm'],
             encoder=encoders.get('actor'),
-            tanh_squash=True,  # Enable tanh squashing for bounded actions
-            state_dependent_std=True,  # Enable state-dependent std for SAC
-            # No low/high: actor outputs in [-1, 1] (standard tanh bounds).
-            # Original DSRL-NA actor operates in the env's [-1, 1] action space.
-            # Using action_magnitude here causes a log_det scaling in log_prob that
-            # makes entropy negative, driving temperature up and Q-values to -inf.
+            tanh_squash=True,
+            state_dependent_std=True,
+            # No low/high: actor outputs in [-1, 1] (standard tanh bounds). Passing
+            # action_magnitude here adds a log_det scaling in log_prob that makes
+            # entropy negative, driving temperature up and Q-values to -inf.
             **_two_tier_kwargs,
         )
 
         temp_def = LogParam(init_value=config['init_temperature'])
 
-        # Time embedding
         time_emb_type = config.get('time_embedding', 'scalar')
         time_emb_module = None
         if time_emb_type == 'sinusoidal':
             time_emb_module = SinusoidalTimeEmbedding(embed_dim=config.get('time_embedding_dim', 32))
 
-        # Define flow matching actor network.
         actor_bc_flow_def = ActorVectorField(
             hidden_dims=config['actor_hidden_dims'],
             action_dim=full_action_dim,
@@ -1164,8 +1009,7 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             time_embedding=time_emb_module,
             **_two_tier_kwargs,
         )
-        
-        # Separate network definitions
+
         actor_nets = {
             'actor': actor_def,
             'temp': temp_def,
@@ -1207,13 +1051,11 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             'actor_bc_flow': (ex_observations, full_actions, ex_times),
         }
 
-        # Create separate network definitions
         actor_net_def = ModuleDict(actor_nets)
         critic_net_def = ModuleDict(critic_nets)
         noise_critic_net_def = ModuleDict(noise_critic_nets)
         bc_flow_net_def = ModuleDict(bc_flow_nets)
 
-        # Create separate optimizers - ensure learning rates are Python floats
         actor_lr = float(config['lr_actor'])
         critic_lr = float(config['lr_critic'])
         noise_critic_lr = float(config.get('lr_noise_critic', config['lr_critic']))
@@ -1226,7 +1068,6 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         clip_norm = float(config.get('clip_grad_norm', 1000.0))
 
         def get_optimizer(lr, opt_type):
-            # lr is already a Python float
             if opt_type == 'adam':
                 base = optax.adam(learning_rate=lr)
             elif opt_type == 'adamw':
@@ -1242,20 +1083,17 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         noise_critic_tx = get_optimizer(noise_critic_lr, critic_opt_type)
         bc_flow_tx = get_optimizer(bc_flow_lr, bc_flow_opt_type)
 
-        # Initialize parameters
         rng, actor_rng, critic_rng, nc_rng, bc_flow_rng = jax.random.split(rng, 5)
         actor_params = actor_net_def.init(actor_rng, **actor_args)['params']
         critic_params = critic_net_def.init(critic_rng, **critic_args)['params']
         noise_critic_params = noise_critic_net_def.init(nc_rng, **noise_critic_args)['params']
         bc_flow_params = bc_flow_net_def.init(bc_flow_rng, **bc_flow_args)['params']
 
-        # Create separate train states
         actor_state = TrainState.create(actor_net_def, actor_params, actor_tx)
         critic_state = TrainState.create(critic_net_def, critic_params, critic_tx)
         noise_critic_state = TrainState.create(noise_critic_net_def, noise_critic_params, noise_critic_tx)
         bc_flow_state = TrainState.create(bc_flow_net_def, bc_flow_params, bc_flow_tx)
-        
-        # Initialize target networks
+
         critic_state.params[f'modules_target_critic'] = critic_state.params[f'modules_critic']
 
         config['ob_dims'] = ob_dims
@@ -1265,17 +1103,15 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
         if config['target_entropy'] is None:
             config['target_entropy'] = -float(noise_dim) / 2
 
-        # DSRL+EXPO: Initialize action critic and edit actor if enabled
         action_critic_state = None
         edit_actor_state = None
 
         if config['use_edit_actor']:
-            # Add encoder for action critic and edit actor
             if config['encoder'] is not None:
                 encoders['action_critic'] = encoder_module()
                 encoders['edit_actor'] = encoder_module()
 
-            # Define action critic (evaluates Q(obs, refined_action))
+            # Action critic: evaluates Q(obs, refined_action)
             action_critic_def = Value(
                 hidden_dims=config['action_critic_hidden_dims'],
                 layer_norm=config['layer_norm'],
@@ -1301,7 +1137,6 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
 
             edit_temp_def = LogParam(init_value=config['edit_init_temperature'])
 
-            # Network definitions
             action_critic_nets = {
                 'action_critic': action_critic_def,
                 'target_action_critic': copy.deepcopy(action_critic_def),
@@ -1320,11 +1155,9 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
                 'edit_temp': (),
             }
 
-            # Create network definitions
             action_critic_net_def = ModuleDict(action_critic_nets)
             edit_actor_net_def = ModuleDict(edit_actor_nets)
 
-            # Get optimizers
             action_critic_lr = config['lr_action_critic']
             edit_actor_lr = config['lr_edit_actor']
 
@@ -1334,19 +1167,15 @@ class DSRLEXPOAgent(flax.struct.PyTreeNode):
             action_critic_tx = get_optimizer(action_critic_lr, action_critic_opt_type)
             edit_actor_tx = get_optimizer(edit_actor_lr, edit_actor_opt_type)
 
-            # Initialize parameters
             rng, action_critic_rng, edit_actor_rng = jax.random.split(rng, 3)
             action_critic_params = action_critic_net_def.init(action_critic_rng, **action_critic_args)['params']
             edit_actor_params = edit_actor_net_def.init(edit_actor_rng, **edit_actor_args)['params']
 
-            # Create train states
             action_critic_state = TrainState.create(action_critic_net_def, action_critic_params, action_critic_tx)
             edit_actor_state = TrainState.create(edit_actor_net_def, edit_actor_params, edit_actor_tx)
 
-            # Initialize target action critic
             action_critic_state.params[f'modules_target_action_critic'] = action_critic_state.params[f'modules_action_critic']
 
-            # Set edit target entropy
             if config['edit_target_entropy'] is None:
                 config['edit_target_entropy'] = -float(full_action_dim) / 2
 

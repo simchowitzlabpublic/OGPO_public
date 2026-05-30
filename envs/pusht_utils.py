@@ -14,7 +14,6 @@ import os
 import gdown
 import zarr
 
-# --- Pymunk Override ---
 from pymunk.space_debug_draw_options import SpaceDebugColor
 
 positive_y_is_up: bool = False
@@ -115,8 +114,6 @@ def light_color(color: SpaceDebugColor):
     color = SpaceDebugColor(r=color[0], g=color[1], b=color[2], a=color[3])
     return color
 
-# --- Helper Functions ---
-
 def pymunk_to_shapely(body, shapes):
     geoms = list()
     for shape in shapes:
@@ -141,8 +138,6 @@ def farthest_point_sampling(points: np.ndarray, n_points: int, init_idx: int):
         chosen_points.append(next_pt)
     result = np.array(chosen_points)
     return result
-
-# --- Keypoint Manager ---
 
 from matplotlib import cm
 
@@ -240,8 +235,6 @@ class PymunkKeypointManager:
         return img
 
 
-# --- Environments ---
-
 class PushTEnv(gymnasium.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
     reward_range = (0., 1.)
@@ -260,10 +253,8 @@ class PushTEnv(gymnasium.Env):
         self.window_size = ws = 512  # The size of the PyGame window
         self.render_size = render_size
         self.sim_hz = 100
-        # Local controller params.
-        self.k_p, self.k_v = 100, 20    # PD control.z
+        self.k_p, self.k_v = 100, 20    # PD control gains.
         self.control_hz = self.metadata['render_fps']
-        # legcay set_state for data compatibility
         self.legacy = legacy
 
         # agent_pos, block_pos, block_angle
@@ -332,14 +323,10 @@ class PushTEnv(gymnasium.Env):
         if action is not None:
             self.latest_action = action
             for i in range(n_steps):
-                # Step PD control.
                 acceleration = self.k_p * (action - self.agent.position) + self.k_v * (Vec2d(0, 0) - self.agent.velocity)
                 self.agent.velocity += acceleration * dt
-
-                # Step physics.
                 self.space.step(dt)
 
-        # compute reward
         goal_body = self._get_goal_pose_body(self.goal_pose)
         goal_geom = pymunk_to_shapely(goal_body, self.block.shapes)
         block_geom = pymunk_to_shapely(self.block, self.block.shapes)
@@ -349,46 +336,42 @@ class PushTEnv(gymnasium.Env):
         coverage = intersection_area / goal_area
         done = coverage > self.success_threshold
 
-        # Calculate reward based on rew_fn
         if self.rew_fn == 'sparse':
             reward = 0.0 if done else -1.0
         elif self.rew_fn == 'sparse_slow':
             reward = 0.0 if done else -1.0 * (1 + np.linalg.norm(action - self.prev_action)/200)
             self.prev_action = action
         elif self.rew_fn == 'l2':
-            # L2 distance between block pose and goal pose
             block_pos = np.array(self.block.position)
             goal_pos = self.goal_pose[:2]
             pos_dist = np.linalg.norm(block_pos - goal_pos)
 
-            # Angle distance (handle wraparound)
+            # Angle distance, handling wraparound.
             block_angle = self.block.angle % (2 * np.pi)
             goal_angle = self.goal_pose[2] % (2 * np.pi)
             angle_diff = abs(block_angle - goal_angle)
             angle_dist = min(angle_diff, 2 * np.pi - angle_diff)
 
-            # Combine position and angle distances (normalize angle to similar scale)
-            # Angle is weighted by a factor (e.g., 50 to match position scale)
+            # Angle weighted by 50 to match the position scale.
             reward = -(pos_dist + 50 * angle_dist)
         elif self.rew_fn == 'l1':
-            # L1 distance between block pose and goal pose
             block_pos = np.array(self.block.position)
             goal_pos = self.goal_pose[:2]
             pos_dist = np.sum(np.abs(block_pos - goal_pos))
 
-            # Angle distance (handle wraparound)
+            # Angle distance, handling wraparound.
             block_angle = self.block.angle % (2 * np.pi)
             goal_angle = self.goal_pose[2] % (2 * np.pi)
             angle_diff = abs(block_angle - goal_angle)
             angle_dist = min(angle_diff, 2 * np.pi - angle_diff)
 
-            # Combine position and angle distances (normalize angle to similar scale)
+            # Angle weighted by 50 to match the position scale.
             reward = -(pos_dist + 50 * angle_dist)
         else:
             raise ValueError(f"Unknown reward function: {self.rew_fn}")
 
         terminated = bool(done)
-        truncated = False # PushT usually doesn't have a time limit in the env itself, handled by wrapper
+        truncated = False  # Time limit is handled by the TimeLimit wrapper.
 
         observation = self._get_obs()
         info = self._get_info(coverage=coverage)
@@ -468,9 +451,6 @@ class PushTEnv(gymnasium.Env):
                 coord = (action / 512 * 96).astype(np.int32)
                 marker_size = int(8/96*self.render_size)
                 thickness = int(1/96*self.render_size)
-                # cv2.drawMarker(img, coord,
-                #     color=(255,0,0), markerType=cv2.MARKER_CROSS,
-                #     markerSize=marker_size, thickness=thickness)
         return img
 
 
@@ -699,8 +679,6 @@ class PushTKeypointsEnv(PushTEnv):
                 img, self.draw_kp_map, radius=int(img.shape[0]/96))
         return img
 
-# --- Factory and Dataset ---
-
 def make_env(env_name, seed=None, rew_fn='sparse'):
     if env_name == 'pusht-keypoints-v0':
         env = PushTKeypointsEnv(render_mode="rgb_array", rew_fn=rew_fn)
@@ -757,53 +735,33 @@ def get_dataset(env_name):
         dataset_path = os.path.join(os.path.expanduser('~/.ogpo/datasets/pusht'), 'pusht', 'pusht_cchi_v7_replay.zarr')
         if not os.path.exists(dataset_path):
             print(f"Downloading PushT dataset to {dataset_path}...")
-            # Create directory
             os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
-            # Download zip
             url = "https://diffusion-policy.cs.columbia.edu/data/training/pusht.zip"
             zip_path = dataset_path + ".zip"
             import urllib.request
             urllib.request.urlretrieve(url, zip_path)
-            # Unzip
             import zipfile
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(os.path.dirname(os.path.dirname(dataset_path)))
-            # Remove zip
             os.remove(zip_path)
 
         print(f"Loading dataset from {dataset_path}")
         import zarr
         root = zarr.open(dataset_path, mode='r')
 
-        # Load data
         data = {
             'observations': root['data']['state'][:],
             'actions': root['data']['action'][:],
-            'terminals': root['data']['n_contacts'][:] > 0, # Placeholder, will fix below
-            'rewards': root['data']['n_contacts'][:] # Placeholder
+            'terminals': root['data']['n_contacts'][:] > 0,
+            'rewards': root['data']['n_contacts'][:]
         }
 
-        # Fix terminals and rewards
-        # The dataset doesn't have explicit terminals/rewards for RL, so we generate them
-        # We need to run the environment to generate rewards and next_observations
-        # Or we can just use the state transitions
-
-        # Actually, for PushT, we can just use the state/action data directly
-        # But we need next_observations and rewards for RL
-
-        # Let's use the environment to generate proper RL transitions
-        # This is a bit slow but ensures consistency
-
-        # Optimization: The dataset contains state trajectories. 
-        # We can just shift states to get next_observations.
-        # Rewards can be calculated from coverage.
-
-        # Re-loading to ensure we have clean data
+        # The dataset has no explicit RL terminals/rewards, so we regenerate
+        # them: shift states for next_observations and use sparse rewards.
         states = root['data']['state'][:]
         actions = root['data']['action'][:]
         episode_ends = root['meta']['episode_ends'][:]
 
-        # Create lists
         observations = []
         next_observations = []
         act = []
@@ -811,26 +769,11 @@ def get_dataset(env_name):
         term = []
         masks = []
 
-        # We need to generate keypoints from states
+        # Convert raw states to keypoints via the env, then normalize.
         env = make_env(env_name)
         env.reset()
-        # Unwrap normalization for internal use if needed, but actually we want normalized data in dataset
-        # So we should use the wrapped env to get normalized observations?
-        # No, make_env now returns a normalized env.
-        # But we need to be careful. The dataset contains raw states.
-        # We should convert raw states to raw keypoints, THEN normalize.
-
-        # Access the underlying env to get keypoint manager
-        # The env is TimeLimit(PushTNormalizationWrapper(TimeLimit(PushTKeypointsEnv)))
-        # Wait, make_env structure:
-        # env = PushTKeypointsEnv()
-        # env = TimeLimit(env)
-        # env = PushTNormalizationWrapper(env)
-
-        # So env.unwrapped is PushTKeypointsEnv
         kp_manager = env.unwrapped.kp_manager
 
-        # Helper to normalize
         def normalize(x):
             return 2 * (x - 0.0) / (512.0 - 0.0) - 1
 
@@ -841,64 +784,34 @@ def get_dataset(env_name):
             episode_states = states[start_idx:end_idx]
             episode_actions = actions[start_idx:end_idx]
 
-            # Generate keypoints for all states in episode
-            # We can do this efficiently
-
             for i in range(len(episode_states)):
                 state = episode_states[i]
                 action = episode_actions[i]
 
-                # Get observation (keypoints) from state
-                # We need to set the state in the env to get the correct keypoints
-                # Actually _set_state is fast enough.
-
-                # We can use the static method if we refactor, but let's just use the env instance
+                # Set the env state to obtain the corresponding keypoint obs.
                 env.unwrapped._set_state(state)
                 obs = env.unwrapped._get_obs()
 
-                # Normalize observation
                 obs = np.clip(normalize(obs), -1.0, 1.0)
-
-                # Normalize action
                 action = np.clip(normalize(action), -1.0, 1.0)
 
                 observations.append(obs)
                 act.append(action)
 
-                # Next observation
                 if i < len(episode_states) - 1:
                     next_state = episode_states[i+1]
                     env.unwrapped._set_state(next_state)
                     next_obs = env.unwrapped._get_obs()
                     next_obs = np.clip(normalize(next_obs), -1.0, 1.0)
 
-                    # Reward (sparse)
-                    # We can calculate coverage
-                    # But simpler: -1 per step, 0 if success
-                    # Success is coverage > 0.95
-                    # We need to check coverage for next_state
-                    # env._set_state updates the simulation, so we can check coverage
-                    # But _set_state might not update coverage variable in env?
-                    # _set_state calls _get_info which calculates coverage? No.
-                    # Let's look at _get_info in PushTEnv
-
-                    # We need to manually calculate coverage or step the env.
-                    # Stepping is safer but slower.
-                    # Given we have the trajectory, we assume the actions led to the next state.
-
-                    # Let's just use -1 for all steps except the last one if it was successful?
-                    # But some episodes might end early?
-                    # Let's just use -1.0 for all transitions in dataset for now, 
-                    # except maybe the last one?
-
+                    # Sparse reward: -1 per step, success handled at episode end.
                     reward = -1.0
                     done = False
 
                 else:
-                    # Last step
-                    # Duplicate observation for next_obs (standard practice)
+                    # Last step: duplicate obs and assume the demonstration succeeded.
                     next_obs = obs.copy()
-                    reward = 0.0 # Assume success at end of demonstration
+                    reward = 0.0
                     done = True
 
                 next_observations.append(next_obs)

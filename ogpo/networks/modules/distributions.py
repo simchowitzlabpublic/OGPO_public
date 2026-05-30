@@ -6,14 +6,10 @@ import distrax
 
 
 class RescaleFromTanhBijector(distrax.Bijector):
-    """Custom bijector to rescale from (-1, 1) to (low, high).
+    """Rescaling bijector mapping (-1, 1) to (low, high).
 
-    This replaces distrax.Lambda to avoid JAX 0.6.0+ compatibility issues
-    with jax.core.Var being removed.
-
-    Attributes:
-        low: Lower bound of the target range.
-        high: Upper bound of the target range.
+    Replaces distrax.Lambda to avoid JAX 0.6.0+ incompatibility with the
+    removed jax.core.Var.
     """
 
     def __init__(self, low: jnp.ndarray, high: jnp.ndarray):
@@ -22,38 +18,20 @@ class RescaleFromTanhBijector(distrax.Bijector):
         self._high = high
 
     def forward_and_log_det(self, x):
-        """Transform from (-1, 1) to (low, high).
-
-        Args:
-            x: Input in range (-1, 1).
-
-        Returns:
-            y: Output in range (low, high).
-            log_det: Log determinant of the Jacobian.
-        """
+        """Transform from (-1, 1) to (low, high)."""
         # (-1, 1) => (0, 1) => (low, high)
         y = (x + 1) / 2
         y = y * (self._high - self._low) + self._low
-        # Log det jacobian
         high_ = jnp.broadcast_to(self._high, x.shape)
         low_ = jnp.broadcast_to(self._low, x.shape)
         log_det = jnp.sum(jnp.log(0.5 * (high_ - low_)), -1)
         return y, log_det
 
     def inverse_and_log_det(self, y):
-        """Transform from (low, high) to (-1, 1).
-
-        Args:
-            y: Input in range (low, high).
-
-        Returns:
-            x: Output in range (-1, 1).
-            log_det: Log determinant of the Jacobian.
-        """
+        """Transform from (low, high) to (-1, 1)."""
         # (low, high) => (0, 1) => (-1, 1)
         x = (y - self._low) / (self._high - self._low)
         x = 2 * x - 1
-        # Log det jacobian (negative of forward)
         high_ = jnp.broadcast_to(self._high, y.shape)
         low_ = jnp.broadcast_to(self._low, y.shape)
         log_det = -jnp.sum(jnp.log(0.5 * (high_ - low_)), -1)
@@ -61,10 +39,7 @@ class RescaleFromTanhBijector(distrax.Bijector):
 
 
 class TanhMultivariateNormalDiag(distrax.Transformed):
-    """Multivariate normal distribution with tanh squashing.
-
-    This distribution applies a tanh transformation to a multivariate normal
-    distribution, optionally rescaling to a specified range (low, high).
+    """Multivariate normal with tanh squashing, optionally rescaled to (low, high).
 
     Commonly used in SAC and other continuous control RL algorithms.
     """
@@ -73,13 +48,6 @@ class TanhMultivariateNormalDiag(distrax.Transformed):
                  distribution: distrax.Distribution,
                  low: Optional[jnp.ndarray] = None,
                  high: Optional[jnp.ndarray] = None):
-        """Initialize the tanh-squashed distribution.
-
-        Args:
-            distribution: Base distribution (typically MultivariateNormalDiag).
-            low: Lower bound for rescaling (optional).
-            high: Upper bound for rescaling (optional).
-        """
         layers = []
         if not (low is None or high is None):
             layers.append(RescaleFromTanhBijector(low=low, high=high))
@@ -91,24 +59,13 @@ class TanhMultivariateNormalDiag(distrax.Transformed):
         super().__init__(distribution=distribution, bijector=bijector)
 
     def mode(self) -> jnp.ndarray:
-        """Compute the mode of the distribution.
-
-        Returns:
-            Mode of the transformed distribution.
-        """
+        """Compute the mode of the distribution."""
         return self.bijector.forward(self.distribution.mode())
 
 
 class TransformedWithMode(distrax.Transformed):
-    """Transformed distribution with mode calculation.
-
-    A convenience class that adds a mode() method to transformed distributions.
-    """
+    """Transformed distribution that adds a mode() method."""
 
     def mode(self):
-        """Compute the mode of the distribution.
-
-        Returns:
-            Mode of the transformed distribution.
-        """
+        """Compute the mode of the distribution."""
         return self.bijector.forward(self.distribution.mode())

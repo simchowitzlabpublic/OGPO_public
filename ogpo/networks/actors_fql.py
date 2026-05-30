@@ -1,9 +1,4 @@
-"""One-step policy network for FQL algorithm.
-
-This module contains the OneStepPolicy network that directly maps
-(state, noise) to actions without ODE solving, used for FQL's
-fast inference and RL training with distillation.
-"""
+"""One-step policy network for the FQL algorithm: maps (state, noise) to actions without ODE solving."""
 
 from typing import Optional, Sequence, Tuple
 
@@ -19,22 +14,9 @@ def default_init(scale=1.0):
 
 
 class OneStepPolicy(nn.Module):
-    """One-step policy for FQL: μω(s, z) → a.
+    """One-step FQL policy mapping (observations, noise) -> action in a single forward pass.
 
-    This policy directly maps observations and noise to actions in a single
-    forward pass, without iterative ODE solving. It learns via distillation
-    from the BC flow policy and Q-value maximization.
-
-    Key differences from ActorVectorField:
-    - ActorVectorField: (obs, action, time) → velocity (requires ODE solving)
-    - OneStepPolicy: (obs, noise) → action (direct mapping)
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions for the MLP.
-        action_dim: Dimension of the action space.
-        layer_norm: Whether to apply layer normalization.
-        final_fc_init_scale: Initialization scale for final layer.
-        encoder: Optional encoder module for observations.
+    Learns via distillation from the BC flow policy and Q-value maximization.
     """
     hidden_dims: Sequence[int] = (512, 512, 512, 512)
     action_dim: int = None
@@ -43,12 +25,9 @@ class OneStepPolicy(nn.Module):
     encoder: nn.Module = None
 
     def setup(self):
-        """Initialize the network layers."""
-        # Single MLP: same architecture as ActorVectorField for better distillation
-        # [hidden_dims..., action_dim] with no activation on output
         self.mlp = MLP(
             (*self.hidden_dims, self.action_dim),
-            activate_final=False,  # No activation on output (like ActorVectorField)
+            activate_final=False,
             layer_norm=self.layer_norm,
         )
 
@@ -59,39 +38,17 @@ class OneStepPolicy(nn.Module):
         is_encoded: bool = False,
         params: Optional[dict] = None,
     ) -> jnp.ndarray:
-        """Forward pass: (observations, noise) → actions.
-
-        Args:
-            observations: State observations (batch_size, obs_dim).
-            noise: Gaussian noise samples (batch_size, action_dim).
-            is_encoded: Whether observations are already encoded.
-            params: Optional parameters (for compatibility with TrainState).
-
-        Returns:
-            actions: Predicted actions (batch_size, action_dim).
-        """
-        # Encode observations if needed
+        """Forward pass mapping (observations, noise) -> actions."""
         if not is_encoded and self.encoder is not None:
             observations = self.encoder(observations)
 
-        # Concatenate observations and noise
         x = jnp.concatenate([observations, noise], axis=-1)
-
-        # Pass through MLP (outputs actions directly, no final activation)
         actions = self.mlp(x)
 
         return actions
 
     def encode(self, observations, images=None):
-        """Encode observations using the encoder.
-
-        Args:
-            observations: Raw observations.
-            images: Optional images (for vision-based policies).
-
-        Returns:
-            Encoded observations.
-        """
+        """Encode observations using the encoder, if any."""
         if self.encoder is None:
             return observations
 

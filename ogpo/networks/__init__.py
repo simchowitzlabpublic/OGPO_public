@@ -1,15 +1,5 @@
-"""OGPO Networks Module.
+"""JAX/Flax network architectures: actors, critics, encoders, and building blocks."""
 
-Neural network architectures for reinforcement learning including:
-- Actors: Policy networks (flow matching, Gaussian, edit policies)
-- Critics: Q-function and value networks
-- Encoders: Vision encoders (IMPALA, MinViT)
-- Modules: Building blocks (MLP, attention, distributions)
-
-All networks are implemented in JAX/Flax.
-"""
-
-# Actor networks
 from ogpo.networks.actors import (
     Actor,
     ActorVectorField,
@@ -19,12 +9,10 @@ from ogpo.networks.actors import (
     EditActor,
 )
 
-# FQL-specific networks
 from ogpo.networks.actors_fql import (
     OneStepPolicy,
 )
 
-# Critic networks
 from ogpo.networks.critics import (
     Value,
     ValueTF,
@@ -34,7 +22,6 @@ from ogpo.networks.critics import (
     ensemblize,
 )
 
-# Miscellaneous utilities
 from ogpo.networks.modules.misc import (
     NoiseInjectionNetwork,
     LogParam,
@@ -43,7 +30,6 @@ from ogpo.networks.modules.misc import (
     zeros_init,
 )
 
-# Encoder registries
 from ogpo.networks.encoders import (
     encoder_modules,
     ImpalaEncoder,
@@ -52,28 +38,24 @@ from ogpo.networks.encoders import (
 )
 
 __all__ = [
-    # Actors
     'Actor',
     'ActorVectorField',
     'ActorVectorFieldTF',
     'ActorVectorFieldSimBa',
     'EditPolicy',
     'EditActor',
-    'OneStepPolicy',  # FQL
-    # Critics
+    'OneStepPolicy',
     'Value',
     'ValueTF',
     'ValueSimBa',
     'ValueMIP',
     'ValueMIPEnsemble',
     'ensemblize',
-    # Utilities
     'NoiseInjectionNetwork',
     'LogParam',
     'Identity',
     'orthogonal_init',
     'zeros_init',
-    # Encoders
     'encoder_modules',
     'ImpalaEncoder',
     'MinViT',

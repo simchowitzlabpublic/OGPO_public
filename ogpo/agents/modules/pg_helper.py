@@ -59,7 +59,6 @@ def sample_flow_actions_ode(
     """Sample actions using deterministic ODE flow (Euler integration)."""
     batch_size = observations.shape[0]
 
-    # Initialize with noise
     if noises is None:
         actions = jax.random.normal(rng, (batch_size, act_dim))
     else:
@@ -111,7 +110,6 @@ def sample_flow_actions_ode_with_correction(
         t = jnp.full((batch_size, 1), i / flow_steps)
         vels, z_pred = actor_fn(observations, actions, t, is_encoded=is_encoded, return_denoiser=True)
 
-        # SDE-to-ODE correction
         vels = vels + correction_coeff * z_pred
         actions = actions + vels * dt
 
@@ -166,7 +164,6 @@ def sample_flow_actions_sde(
     """
     batch_size = observations.shape[0]
 
-    # Determine which transitions contribute to logprob
     effective_ft = ft_flow_steps if (0 < ft_flow_steps < flow_steps) else flow_steps
     ft_start = flow_steps - effective_ft  # first transition index to include
 
@@ -175,8 +172,8 @@ def sample_flow_actions_sde(
     chains = [actions]
     sigmas = []
 
-    # Initial log prob: p(x_0) ~ N(0, I)
-    # Include only when computing over the full chain (cancels in ratio either way)
+    # Initial log prob p(x_0) ~ N(0, I); included only over the full chain
+    # (cancels in the IS ratio either way).
     init_dist = distrax.Normal(jnp.zeros((batch_size, act_dim)), 1.0)
     if ft_start == 0:
         logprob = init_dist.log_prob(actions).sum(-1)
@@ -190,7 +187,6 @@ def sample_flow_actions_sde(
         t = jnp.full((batch_size, 1), i / flow_steps)
         is_last_step = (i == flow_steps - 1)
 
-        # Get velocity
         if params is not None:
             vels = actor_fn(observations, actions, t, params=params, is_encoded=is_encoded)
         else:
@@ -209,13 +205,11 @@ def sample_flow_actions_sde(
         else:
             drift = vels
 
-        # Compute mean of next action
         mean_next = actions + drift * dt
 
         if clip_intermediate:
             mean_next = jnp.clip(mean_next, -clip_value, clip_value)
 
-        # Get noise std
         if use_tapered_noise:
             sigma = constant_noise_std * jnp.sqrt(jnp.maximum(1.0 - t, 0.0)) * jnp.ones(actions.shape)
         elif use_constant_noise:
@@ -237,8 +231,7 @@ def sample_flow_actions_sde(
         # makes the step deterministic at mean_next; we bypass distrax to avoid
         # log_prob(N(mu, 0)) = inf.
         if use_constant_noise and is_last_step:
-            actions = mean_next
-            # No stochastic transition -> no logprob contribution this step.
+            actions = mean_next  # deterministic step -> no logprob contribution
         else:
             step_dist = distrax.Normal(mean_next, sigma)
             rng, noise_key = jax.random.split(rng)
@@ -294,7 +287,6 @@ def compute_flow_log_prob(
     act_dim = chains.shape[-1]
     dt = 1.0 / flow_steps
 
-    # Determine which transitions contribute to logprob
     effective_ft = ft_flow_steps if (0 < ft_flow_steps < flow_steps) else flow_steps
     ft_start = flow_steps - effective_ft  # first transition index to include
 
@@ -302,8 +294,8 @@ def compute_flow_log_prob(
     joint_entropy = 0.0
     logprob_steps = 0
 
-    # Initial probability: p(x_0) ~ N(0, I)
-    # Include only when computing over the full chain (cancels in ratio either way)
+    # Initial prob p(x_0) ~ N(0, I); included only over the full chain
+    # (cancels in the IS ratio either way).
     init_dist = distrax.Normal(jnp.zeros((batch_size, act_dim)), 1.0)
     if ft_start == 0:
         logprob_init = init_dist.log_prob(chains[:, 0]).sum(-1)
@@ -314,11 +306,9 @@ def compute_flow_log_prob(
             entropy_init = init_dist.entropy().sum(-1)
             joint_entropy = joint_entropy + entropy_init
 
-    # Pre-compute chain slices
     chains_prev = chains[:, :-1, :]  # [B, flow_steps, act_dim]
     chains_next = chains[:, 1:, :]   # [B, flow_steps, act_dim]
 
-    # Compute velocities, drifts, and sigmas for all steps
     chains_vel = jnp.zeros_like(chains_prev)
     chains_drift = jnp.zeros_like(chains_prev)
     chains_stds = jnp.zeros_like(chains_prev)
@@ -365,7 +355,6 @@ def compute_flow_log_prob(
         chains_drift = chains_drift.at[:, i, :].set(drift)
         chains_stds = chains_stds.at[:, i, :].set(sigma)
 
-    # Compute means for all transitions using drift (= velocity + optional correction)
     chains_mean = chains_prev + chains_drift * dt
 
     # Clip intermediate means to match SDE sampling behavior
@@ -405,7 +394,6 @@ def compute_flow_log_prob(
     else:
         entropy_rate = None
 
-    # Normalization
     if normalize_horizon:
         logprob = logprob / logprob_steps
 
@@ -444,7 +432,6 @@ def compute_ppo_loss(log_probs: jnp.ndarray, old_log_probs: jnp.ndarray, advanta
     if config.adv_clip_min is not None:
         advantages = jnp.clip(advantages, config.adv_clip_min)
 
-    # PPO loss
     pg_loss = -jnp.mean(jnp.minimum(ratio * advantages, clipped_ratio * advantages))
 
     stats = {
@@ -501,9 +488,8 @@ def compute_ogpo_advantages(q_agg: jnp.ndarray, q_full: jnp.ndarray, config) -> 
         # Per-Q-network advantage: A_{i,m} = Q_m(s,a_i) - (1/G) sum_{i'} Q_m(s,a_{i'})
         adv_per_q = q_full - q_full.mean(axis=0, keepdims=True)  # [G, M, batch]
         return _safe_max(adv_per_q, axis=1), q_full.mean(axis=1)
-        
+
     elif config.adv_strategy == 'penultimate':
-        # Per-Q-network advantage: A_{i,m} = Q_m(s,a_i) - (1/G) sum_{i'} Q_m(s,a_{i'})
         adv_per_q = q_full - q_full.mean(axis=0, keepdims=True)  # [G, M, batch]
         return _penultimate_safe_max(adv_per_q, axis=1), q_full.mean(axis=1)
 
@@ -514,7 +500,7 @@ def compute_ogpo_advantages(q_agg: jnp.ndarray, q_full: jnp.ndarray, config) -> 
             weights = jnp.exp(jnp.maximum(0.0, advantages) / config.awr_beta)
         elif awr_mode == 'positive_only':
             weights = jnp.exp(advantages / config.awr_beta) * (advantages > 0).astype(jnp.float32)
-        else:  # symmetric (default, matches original behavior)
+        else:  # symmetric (default)
             weights = jnp.exp(advantages / config.awr_beta)
         awr_weight_max = config.get('awr_weight_max', 20.0)
         weights = jnp.clip(weights, 0.0, awr_weight_max)
@@ -522,8 +508,6 @@ def compute_ogpo_advantages(q_agg: jnp.ndarray, q_full: jnp.ndarray, config) -> 
     else:
         raise ValueError(f"Unknown adv_strategy: {config.adv_strategy}")
 
-
-# ===================== chi2-Pessimistic OGPO (chiPO) =====================
 
 def compute_chi_po_beta(q_full: jnp.ndarray, config) -> jnp.ndarray:
     """Anneal chi_po beta with Q confidence. q_full shape [G, M, batch]. Ensemble axis = 1."""
@@ -639,8 +623,6 @@ def compute_chi_po_ppo_loss(
     return pg_loss, stats
 
 
-# ===================== FPO / FPO++ =====================
-
 def compute_spo_penalty(
     ratios: jnp.ndarray,
     advantages: jnp.ndarray,
@@ -689,23 +671,19 @@ def compute_fpo_cfm_ratios(
     batch_size = observations.shape[0]
     act_dim = actions.shape[-1]
 
-    # 1. Draw shared MC samples
     rng, tau_key, eps_key = jax.random.split(rng, 3)
     taus = jax.random.uniform(tau_key, (n_mc,))                      # [n_mc]
     eps = jax.random.normal(eps_key, (n_mc, batch_size, act_dim))    # [n_mc, batch, act_dim]
 
-    # 2. Compute noised actions and velocity targets
     taus_expanded = taus[:, None, None]                              # [n_mc, 1, 1]
     x_tau = taus_expanded * actions[None] + (1.0 - taus_expanded) * eps   # [n_mc, batch, act_dim]
     vel_target = actions[None] - eps                                      # [n_mc, batch, act_dim]
 
-    # 3. Compute CFM loss for each MC sample
     def single_mc_cfm_loss(x_tau_i, vel_target_i, tau_i, actor_fn):
         t = jnp.full((batch_size, 1), tau_i)
         v_pred = actor_fn(observations, x_tau_i, t)
         diff = v_pred - vel_target_i
         if use_huber:
-            # Huber loss (matches reference FPO: MSE when |err|<=delta, linear beyond)
             abs_diff = jnp.abs(diff)
             per_dim = jnp.where(
                 abs_diff <= huber_delta,
@@ -721,11 +699,9 @@ def compute_fpo_cfm_ratios(
     cfm_old = vmapped_cfm(x_tau, vel_target, taus, old_actor_fn)    # [n_mc, batch]
     cfm_new = vmapped_cfm(x_tau, vel_target, taus, new_actor_fn)    # [n_mc, batch]
 
-    # 4. Clamp individual losses
     cfm_old = jnp.clip(cfm_old, 0.0, cfm_loss_clamp)
     cfm_new = jnp.clip(cfm_new, 0.0, cfm_loss_clamp)
 
-    # 5. Compute ratios
     if per_sample:
         diff = cfm_old - cfm_new                                    # [n_mc, batch]
         diff = jnp.clip(diff, -cfm_diff_clamp, cfm_diff_clamp)
@@ -779,12 +755,10 @@ def compute_fpo_ppo_loss(
     clipped_ratios = jnp.clip(ratios, lower_bound, upper_bound)
 
     if use_aspo:
-        # PPO branch for positive advantages
+        # PPO objective for positive advantages, SPO restoring penalty for negative.
         ppo_obj = jnp.minimum(ratios * adv, clipped_ratios * adv)
-        # SPO branch for negative advantages
         spo_penalty = compute_spo_penalty(ratios, adv, clip_epsilon)
         spo_obj = ratios * adv - spo_penalty
-        # Select based on advantage sign
         pos_mask = adv > 0
         objective = jnp.where(pos_mask, ppo_obj, spo_obj)
     else:
@@ -792,9 +766,8 @@ def compute_fpo_ppo_loss(
 
     pg_loss = -jnp.mean(objective)
 
-    # Stats (compatible with compute_ppo_loss output keys)
     ratio_flat = ratios.reshape(-1)
-    approx_kl = jnp.float32(0.0)  # Not meaningful for FPO (no log-prob ratio)
+    approx_kl = jnp.float32(0.0)  # not meaningful for FPO (no log-prob ratio)
     stats = {
         'ratio': ratio_flat.mean(),
         'ratio_std': ratio_flat.std(),
@@ -808,8 +781,6 @@ def compute_fpo_ppo_loss(
 
     return pg_loss, stats
 
-
-# ===================== AWR (Advantage-Weighted Regression) for Flow Matching =====================
 
 def compute_awr_cfm_loss(
     actor_fn: Callable,
@@ -843,7 +814,6 @@ def compute_awr_cfm_loss(
     batch_size = observations.shape[0]
     act_dim = actions.shape[-1]
 
-    # 1. Compute AWR weights based on mode
     if awr_mode == 'asymmetric':
         weights = jnp.exp(jnp.maximum(0.0, advantages) / awr_beta)
     elif awr_mode == 'positive_only':
@@ -855,17 +825,14 @@ def compute_awr_cfm_loss(
     weight_sum = weights.mean() + 1e-8
     weights = weights / weight_sum  # normalize so mean weight ≈ 1
 
-    # 2. Draw MC samples for CFM loss
     rng, tau_key, eps_key = jax.random.split(rng, 3)
     taus = jax.random.uniform(tau_key, (n_mc,))
     eps = jax.random.normal(eps_key, (n_mc, batch_size, act_dim))
 
-    # 3. Compute noised actions and velocity targets (OT flow matching)
     taus_expanded = taus[:, None, None]
     x_tau = taus_expanded * actions[None] + (1.0 - taus_expanded) * eps
     vel_target = actions[None] - eps
 
-    # 4. Compute CFM loss for each MC sample
     def single_mc_cfm_loss(x_tau_i, vel_target_i, tau_i):
         t = jnp.full((batch_size, 1), tau_i)
         v_pred = actor_fn(observations, x_tau_i, t)
@@ -874,7 +841,6 @@ def compute_awr_cfm_loss(
     cfm_losses = jax.vmap(single_mc_cfm_loss)(x_tau, vel_target, taus)  # [n_mc, batch]
     cfm_loss_per_sample = cfm_losses.mean(axis=0)  # [batch]
 
-    # 5. Weighted loss
     loss = jnp.mean(weights * cfm_loss_per_sample)
 
     stats = {
@@ -936,7 +902,6 @@ def compute_cfm_chi2_ratio(
     return jax.lax.stop_gradient(ratio)
 
 
-# MIP Stuff
 def sample_mip_actions_sde(
         actor_fn: Callable,
         noise_fn: Callable,
@@ -983,11 +948,9 @@ def sample_mip_actions_sde(
     chains = [x_0]
     sigmas = []
 
-    # Initial log prob: p(x_0) ~ N(0, I)
     init_dist = distrax.Normal(jnp.zeros((batch_size, act_dim)), 1.0)
     logprob = init_dist.log_prob(x_0).sum(-1)
 
-    # Step 1: t=0
     t_0 = jnp.zeros((batch_size, 1))
     if params is not None:
         mean_0 = actor_fn(observations, x_0, t_0, params=params, is_encoded=is_encoded)
@@ -1010,7 +973,6 @@ def sample_mip_actions_sde(
     logprob = logprob + step_0_dist.log_prob(a_0_hat).sum(-1)
     chains.append(a_0_hat)
 
-    # Step 2: t=t*
     t_star = jnp.full((batch_size, 1), mip_t_star)
     if params is not None:
         mean_final = actor_fn(observations, a_0_hat, t_star, params=params, is_encoded=is_encoded)
@@ -1052,10 +1014,7 @@ def sample_mip_actions_ode(
         noises: jnp.ndarray = None,
         is_encoded: bool = False,
     ) -> jnp.ndarray:
-    """
-    Sample actions using MIP (Minimal Iterative Policy) - 2-step flow.
-    MIP uses only two steps: t=0 and t=t* (typically 0.9).
-    """
+    """Sample actions via deterministic 2-step MIP flow (t=0 and t=t*)."""
     batch_size = observations.shape[0]
 
     if noises is None:
@@ -1063,11 +1022,9 @@ def sample_mip_actions_ode(
     else:
         actions = noises
 
-    # Step 1: t=0
     t_0 = jnp.zeros((batch_size, 1))
     a_0_hat = actor_fn(observations, actions, t_0, is_encoded=is_encoded)
 
-    # Step 2: t=t*
     t_star = jnp.full((batch_size, 1), mip_t_star)
     actions = actor_fn(observations, a_0_hat, t_star, is_encoded=is_encoded)
 
@@ -1092,9 +1049,7 @@ def compute_mip_log_prob(
         params: Any = None,
         get_entropy: bool = False,
     ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], Dict]:
-    """
-    Compute log probability for an MIP chain.
-    MIP chains have shape [B, 3, act_dim] -> (x_0, a_0_hat, a_final).
+    """Compute log probability for an MIP chain of shape [B, 3, act_dim] -> (x_0, a_0_hat, a_final).
 
     error_correct_sde_to_ode is ignored: MIP's actor outputs a denoiser, not a
     velocity, so the score-from-velocity correction does not directly apply.
@@ -1123,7 +1078,6 @@ def compute_mip_log_prob(
     joint_entropy = 0.0
     logprob_steps = 0
 
-    # Initial probability: p(x_0) ~ N(0, I)
     init_dist = distrax.Normal(jnp.zeros((batch_size, act_dim)), 1.0)
     logprob_init = init_dist.log_prob(x_0).sum(-1)
     logprob = logprob + logprob_init
@@ -1133,7 +1087,7 @@ def compute_mip_log_prob(
         entropy_init = init_dist.entropy().sum(-1)
         joint_entropy = joint_entropy + entropy_init
 
-    # Step 1: Transition from x_0 to a_0_hat at t=0
+    # Transition from x_0 to a_0_hat at t=0
     t_0 = jnp.zeros((batch_size, 1))
     if params is not None:
         mean_0 = actor_fn(observations, x_0, t_0, params=params, is_encoded=is_encoded)
@@ -1151,7 +1105,7 @@ def compute_mip_log_prob(
         entropy_0 = dist_0.entropy().sum(-1)
         joint_entropy = joint_entropy + entropy_0
 
-    # Step 2: Transition from a_0_hat to a_final at t=t*
+    # Transition from a_0_hat to a_final at t=t*
     t_star = jnp.full((batch_size, 1), mip_t_star)
     if params is not None:
         mean_final = actor_fn(observations, a_0_hat, t_star, params=params, is_encoded=is_encoded)
@@ -1172,7 +1126,6 @@ def compute_mip_log_prob(
     else:
         entropy_rate = None
 
-    # Normalization
     if normalize_horizon:
         logprob = logprob / logprob_steps
 

@@ -186,10 +186,7 @@ class TrainStateSimBa(flax.struct.PyTreeNode):
         )
 
     def apply_loss_fn(self, loss_fn, has_aux=True):
-        # This function needs to be aware of batch_stats
-        
         def loss_and_grad_fn(params):
-            # The loss function now needs both params and batch_stats
             (loss, aux), new_model_state = loss_fn(params, self.batch_stats)
             return loss, (aux, new_model_state)
 
@@ -197,18 +194,17 @@ class TrainStateSimBa(flax.struct.PyTreeNode):
             (loss, (aux, new_model_state)), grads = jax.value_and_grad(loss_and_grad_fn, has_aux=True)(self.params)
             info = {'loss': loss, **aux}
         else:
-            # Simplified case if has_aux is False
             (loss, new_model_state), grads = jax.value_and_grad(loss_and_grad_fn, has_aux=True)(self.params)
             info = {'loss': loss}
 
         new_opt_state = self.tx.update(grads, self.opt_state, self.params)
         new_params = optax.apply_updates(self.params, new_opt_state.updates)
-        
+
         new_state = self.replace(
             step=self.step + 1,
             params=new_params,
             opt_state=new_opt_state,
-            batch_stats=new_model_state['batch_stats'] # IMPORTANT: Update the stats
+            batch_stats=new_model_state['batch_stats']
         )
         return new_state, info
 

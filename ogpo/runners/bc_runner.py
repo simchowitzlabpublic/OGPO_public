@@ -14,9 +14,7 @@ from ogpo.utils.sharding import shard_batch_flat
 
 
 def _wrap_eval_for_frozen_encoder(fn, enc_fn, actor_uses_state=False, use_full_state=True):
-    """
-        Wrap actor function to encode images before calling (frozen encoder mode).
-    """
+    """Wrap an actor function to encode images before calling (frozen encoder mode)."""
     def wrapped(observations, images=None, **kwargs):
         full_state = kwargs.pop('full_state', None)
         if actor_uses_state and full_state is not None:
@@ -150,7 +148,7 @@ def run_bc_training(
                 jax.block_until_ready(agent)
                 eval_step += 1
 
-                # ODE eval (always)
+                # ODE eval
                 eval_actor_fn = getattr(agent, 'compute_flow_actions_corrected', agent.compute_flow_actions)
                 if encode_fn is not None:
                     _actor_uses_state = agent.config.get('_original_actor_obs', 'state') == 'state'
@@ -167,7 +165,7 @@ def run_bc_training(
                 print(f"[EVAL ODE] step={i:6d} | success={ode_success:.4f} | return={eval_info.get('return', 0.0):.4f}", flush=True)
                 logger.log(eval_info, "eval", step=log_step)
 
-                # SDE eval (BON or sample_actions — matches online RL dual eval)
+                # SDE eval (BON or sample_actions), matching the online RL dual eval
                 sde_success = 0.0
                 best_of_n = config.get('best_of_n', 1)
                 if best_of_n > 1 and hasattr(agent, 'sample_actions_BON'):
@@ -194,13 +192,11 @@ def run_bc_training(
                     except Exception:
                         pass
 
-                # Evaluate one-step policy if enabled
                 if config.get('use_one_step_policy', False) and agent.one_step_network is not None:
                     one_step_actor_fn = agent.sample_actions_one_step_BON if best_of_n > 1 else agent.sample_actions_one_step
-                    # Frozen-encoder runs: wrap so the env's raw proprio (9D) gets
-                    # combined with image features into the same 2057D vector the
-                    # one-step MLP was init'd with. Without this, the MLP sees a
-                    # 37D input vs (2085, 512) params and raises ScopeParamShapeError.
+                    # Frozen-encoder runs: wrap so the env's raw proprio gets combined
+                    # with image features into the same vector the one-step MLP was
+                    # init'd with, else apply raises ScopeParamShapeError.
                     if encode_fn is not None:
                         one_step_actor_fn = _wrap_eval_for_frozen_encoder(
                             one_step_actor_fn, encode_fn,

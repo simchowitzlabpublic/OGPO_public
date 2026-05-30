@@ -1,9 +1,4 @@
-"""IMPALA-style convolutional encoders for vision tasks.
-
-This module contains ResNet-based encoder architectures commonly used in
-reinforcement learning, particularly the IMPALA (Importance Weighted Actor-Learner Architecture)
-encoder which has proven effective for visual RL tasks.
-"""
+"""IMPALA-style ResNet convolutional encoders for visual RL tasks."""
 
 import functools
 from typing import Sequence
@@ -15,16 +10,7 @@ from ogpo.networks.modules.mlp import MLP, default_init
 
 
 class ResnetStack(nn.Module):
-    """ResNet stack module.
-
-    A building block consisting of a convolutional layer followed by optional max pooling
-    and a sequence of residual blocks.
-
-    Attributes:
-        num_features: Number of convolutional features.
-        num_blocks: Number of residual blocks in the stack.
-        max_pooling: Whether to apply max pooling after the initial convolution.
-    """
+    """Conv + optional max pool followed by a sequence of residual blocks."""
 
     num_features: int
     num_blocks: int
@@ -74,20 +60,7 @@ class ResnetStack(nn.Module):
 
 
 class ImpalaEncoder(nn.Module):
-    """IMPALA encoder for visual observations.
-
-    A convolutional encoder based on the IMPALA architecture, consisting of
-    multiple ResNet stacks followed by an MLP. This encoder has proven effective
-    for visual reinforcement learning tasks.
-
-    Attributes:
-        width: Width multiplier for the number of features.
-        stack_sizes: Tuple of feature counts for each ResNet stack.
-        num_blocks: Number of residual blocks per stack.
-        dropout_rate: Dropout rate (if None, no dropout is applied).
-        mlp_hidden_dims: Hidden dimensions for the output MLP.
-        layer_norm: Whether to apply layer normalization.
-    """
+    """IMPALA encoder: multiple ResNet stacks followed by an MLP."""
 
     width: int = 1
     stack_sizes: tuple = (16, 32, 32)
@@ -130,17 +103,7 @@ class ImpalaEncoder(nn.Module):
 
 
 class Encoder(nn.Module):
-    """Simple convolutional encoder.
-
-    A lightweight convolutional encoder with configurable strides and feature sizes.
-
-    Attributes:
-        features: Sequence of feature counts for each convolutional layer.
-        strides: Sequence of stride values for each convolutional layer.
-        padding: Padding mode for convolutions.
-        mlp_hidden_dims: Hidden dimensions for the output MLP.
-        layer_norm: Whether to apply layer normalization.
-    """
+    """Lightweight convolutional encoder with configurable strides and features."""
 
     features: Sequence[int] = (32, 32, 32, 32)
     strides: Sequence[int] = (2, 1, 1, 1)
@@ -168,7 +131,6 @@ class Encoder(nn.Module):
         return out
 
 
-# Pre-configured encoder variants
 encoder_modules = {
     'impala': ImpalaEncoder,
     'impala_debug': functools.partial(ImpalaEncoder, num_blocks=1, stack_sizes=(4, 4)),

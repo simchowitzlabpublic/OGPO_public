@@ -1,12 +1,5 @@
-"""Main helper utilities for training pipelines.
-
-Contains shared functions used across all main_*.py files:
-- Environment creation and vectorization
-- Dataset processing
-- Checkpoint management
-- Logging utilities
-- Q-value bounds configuration
-"""
+"""Shared helpers for training pipelines: env creation, dataset processing,
+checkpointing, logging, and Q-value bounds."""
 
 import glob
 import json
@@ -28,10 +21,6 @@ from ogpo.agents.modules.flax_utils import save_agent
 from ogpo.utils.datasets import Dataset, ReplayBuffer
 from ogpo.utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, setup_wandb
 
-
-# =============================================================================
-# Logging Helper
-# =============================================================================
 
 class LoggingHelper:
     """Helper class for unified logging to CSV and WandB."""
@@ -142,7 +131,6 @@ def save_rolling_checkpoint(
     buffer_path = os.path.join(checkpoint_dir, f'{step}_buffer.pkl')
     meta_path = os.path.join(checkpoint_dir, f'{step}_meta.json')
 
-    # Save new checkpoint
     with open(agent_path, 'wb') as f:
         pickle.dump(flax.serialization.to_state_dict(agent), f)
 
@@ -157,7 +145,7 @@ def save_rolling_checkpoint(
 
     print(f"Saved rolling checkpoint to {checkpoint_dir} at step {step}")
 
-    # Cleanup old checkpoints
+    # Remove all but the just-written checkpoint.
     for filename in os.listdir(checkpoint_dir):
         if str(step) in filename:
             continue
@@ -177,12 +165,10 @@ def load_rolling_checkpoint(seed: int, env_name: str, agent_structure: Any, algo
     if not os.path.exists(checkpoint_dir):
         return None, None, None, None, None
 
-    # Find latest step
     files = glob.glob(os.path.join(checkpoint_dir, "*_agent.pkl"))
     if not files:
         return None, None, None, None, None
 
-    # Extract steps
     steps = []
     for f in files:
         try:
@@ -243,7 +229,7 @@ def process_train_dataset(
     else:
         ds = Dataset.create(**ds)
 
-    # Trajectory-level subsampling: keep N randomly selected full rollouts
+    # Trajectory-level subsampling: keep N randomly selected full rollouts.
     if num_offline_trajs > 0 and num_offline_trajs < len(ds.terminal_locs):
         rng = numpy_rng if numpy_rng is not None else np.random.default_rng(42)
         total_trajs = len(ds.terminal_locs)
@@ -260,7 +246,7 @@ def process_train_dataset(
         print(f"[process_train_dataset] Subsampled {num_offline_trajs}/{total_trajs} trajectories "
               f"({keep_mask.sum()}/{len(keep_mask)} transitions)")
 
-    # Handle dataset proportion (transition-level truncation)
+    # Transition-level truncation.
     if dataset_proportion < 1.0:
         new_size = int(len(ds['masks']) * dataset_proportion)
         ds_dict = {k: v[:new_size] for k, v in ds.items()}
@@ -269,10 +255,9 @@ def process_train_dataset(
         else:
             ds = Dataset.create(**ds_dict)
 
-    # NOTE: Robomimic reward transformation is now done in robomimic_utils.get_dataset()
-    # (transforms from [0,1] to [-1,0]). No additional transformation needed here.
+    # Robomimic reward transformation ([0,1] -> [-1,0]) happens in
+    # robomimic_utils.get_dataset(); nothing to do here.
 
-    # Sparse reward conversion
     if sparse:
         sparse_rewards = (ds["rewards"] != 0.0) * -1.0
         ds_dict = {k: v for k, v in ds.items()}
@@ -282,7 +267,6 @@ def process_train_dataset(
         else:
             ds = Dataset.create(**ds_dict)
 
-    # Compute MC returns if needed
     if compute_mc_returns:
         mc_returns = ds.compute_mc_returns(discount)
         ds_dict = {k: v for k, v in ds.items()}
@@ -295,20 +279,8 @@ def process_train_dataset(
     return ds
 
 
-# =============================================================================
-# Q-Value Bounds Configuration
-# =============================================================================
-
 def get_q_bounds(env_name: str, discount: float) -> Tuple[float, float]:
-    """Get Q-value min/max bounds for the environment.
-
-    Args:
-        env_name: Environment name.
-        discount: Discount factor.
-
-    Returns:
-        Tuple of (q_min, q_max).
-    """
+    """Return (q_min, q_max) bounds for the environment."""
     from envs.robomimic_utils import is_robomimic_env
     from envs.env_utils import GYMNASIUM_ROBOTICS_ADROITHAND_ENVS
 
@@ -387,7 +359,7 @@ def setup_experiment_logging(
     wandb_run_id = None
 
     if log_enabled:
-        # Check for existing checkpoint wandb ID
+        # Reuse the wandb run ID from an existing checkpoint, if any.
         checkpoint_wandb_id = None
         if checkpoint_dir_fn is not None:
             try:
@@ -402,7 +374,6 @@ def setup_experiment_logging(
             except Exception as e:
                 print(f"Could not check for existing wandb run ID: {e}")
 
-        # Initialize wandb
         if checkpoint_wandb_id is not None:
             setup_wandb(
                 project=project,
@@ -427,12 +398,10 @@ def setup_experiment_logging(
         save_dir = os.path.join(save_dir, wandb.run.project, run_group, env_name, exp_name)
         os.makedirs(save_dir, exist_ok=True)
 
-        # Save config
         flag_dict = get_flag_dict(config)
         with open(os.path.join(save_dir, 'flags.json'), 'w') as f:
             json.dump(flag_dict, f)
 
-        # Create CSV loggers
         csv_loggers = {
             prefix: CsvLogger(os.path.join(save_dir, f"{prefix}.csv"))
             for prefix in prefixes
@@ -461,7 +430,6 @@ def get_actor_fn_for_rl_eval(agent: Any, config: Dict, use_ode: bool = False) ->
     if use_ode:
         return agent.compute_flow_actions
     else:
-        # Use stochastic sampling (SDE) if available
         if hasattr(agent, 'sample_actions'):
             return agent.sample_actions
         else:

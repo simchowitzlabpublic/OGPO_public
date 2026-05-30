@@ -24,19 +24,12 @@ ALGORITHMS_DUAL_EVAL = {'ogpo', 'expo'}
 
 
 def _wrap_actor_for_frozen_encoder(fn, enc_fn, actor_uses_state=False, use_full_state=True):
-    """Wrap actor function to encode images before calling (frozen encoder mode).
+    """Wrap an actor function to encode images before calling (frozen encoder mode).
 
-    `use_full_state` mirrors agent.use_state and must match the dataset pre-encoding:
-      - True  : encode with full_state (proprio + object pose, e.g. 23D for square).
-      - False : encode with the robot proprio only (e.g. 9D for square).
-
-    The `actor_uses_state=True` branch (low_dim actor on frozen-encoder critic)
-    still forwards full_state when present — that path is unrelated to the
-    image-encoder state choice.
-
-    `full_state` is popped from kwargs (not just read) so we don't forward it to
-    the underlying agent method, which is typically a baseline that only takes
-    (observations, rng). The encoder above has already consumed full_state.
+    `use_full_state` mirrors agent.use_state and must match the dataset
+    pre-encoding (full_state vs robot proprio only). `full_state` is popped (not
+    just read) so it isn't forwarded to the underlying agent method, which is
+    often a baseline taking only (observations, rng).
     """
     def wrapped(observations, images=None, **kwargs):
         full_state = kwargs.pop('full_state', None)
@@ -50,13 +43,10 @@ def _wrap_actor_for_frozen_encoder(fn, enc_fn, actor_uses_state=False, use_full_
 
 
 def _actor_supported_kwargs(actor_fn):
-    """Return the set of kwarg names that `actor_fn` accepts.
+    """Return the set of kwarg names `actor_fn` accepts (None if it has **kwargs).
 
-    Baselines (DSRL/EXPO/QC/FQL) have `sample_actions(observations, rng)` and
-    will raise TypeError if the rollout loop passes the OGPO-only kwargs
-    `images` / `full_state` / `is_encoded`. We introspect once and let the
-    caller filter actor_kwargs accordingly. Returns None when the signature
-    has **kwargs (i.e. accepts anything).
+    Used to filter OGPO-only kwargs (images / full_state / is_encoded) before
+    calling baselines whose sample_actions takes only (observations, rng).
     """
     try:
         sig = inspect.signature(actor_fn)
@@ -81,12 +71,8 @@ def _filter_actor_kwargs(kwargs, supported):
 
 
 def _state_for_encoder(observation, full_state, use_full_state):
-    """Pick the state vector to feed to the frozen image encoder.
-
-    Mirrors agent.use_state: full_state when use_full_state and available,
-    else fall back to the robot proprio. Keeps encode_fn call sites identical
-    to the dataset pre-encoding.
-    """
+    """Pick the state vector to feed the frozen image encoder, mirroring
+    agent.use_state so encode_fn call sites match the dataset pre-encoding."""
     if use_full_state and full_state is not None:
         return full_state
     return observation
@@ -182,10 +168,10 @@ def _q_warmup_collect(
     q_warmup_steps, action_dim, has_images, discount, seed,
     use_success_buffer, mc_regression, encode_fn,
 ):
-    """Phase A of phase-split q_warmup: pure env collection with base actor (no BoN).
+    """Phase A of phase-split q_warmup: env collection with the base actor (no BoN).
 
-    Runs exactly `q_warmup_steps` env steps. Transitions from the final incomplete
-    episode are discarded so the buffer only holds fully-bootstrapped trajectories.
+    Runs `q_warmup_steps` env steps; the final incomplete episode is discarded so
+    the buffer only holds fully-bootstrapped trajectories.
     """
     _use_full_state = agent.config.get('use_state', 'proprio') == 'full'
     online_rng = jax.random.PRNGKey(seed + 40000 + 1)
@@ -229,9 +215,8 @@ def _q_warmup_collect(
         if has_images:
             transition['images'] = ob_images
             transition['next_images'] = next_ob_images
-        # Only attach full_states when NOT pre-encoding: the encoded obs
-        # already folds full_state in, and the replay buffer schema won't
-        # have full_states keys.
+        # Attach full_states only when not pre-encoding: the encoded obs already
+        # folds full_state in and the buffer schema has no full_states keys.
         if ob_full_state is not None and encode_fn is None:
             transition['full_states'] = ob_full_state
             transition['next_full_states'] = next_ob_full_state
@@ -279,10 +264,8 @@ def _q_warmup_train(
 ):
     """Phase B of phase-split q_warmup: run q_warmup_steps * utd_warmup critic updates.
 
-    Each iteration does one `batch_q_warmup_update` on a fresh RB batch of shape
-    (utd_warmup, B, ...), plus one on an SB batch (when enough successes are
-    present). Logs `rb_q_mean` and `sb_q_mean` so the gap between success and
-    general Q-values is observable.
+    Each iteration runs one `batch_q_warmup_update` on a fresh RB batch, plus one
+    on a success-buffer batch when enough successes are present.
     """
     def _maybe_shard(b):
         return shard_batch(b, mesh) if (mesh is not None and b is not None) else b
@@ -399,7 +382,6 @@ def run_online_rl(
         train_dataset = None
         import gc; gc.collect()
 
-    # Replay buffer
     if is_resumed and resumed_replay_buffer is not None:
         replay_buffer = resumed_replay_buffer
     else:
@@ -436,7 +418,7 @@ def run_online_rl(
         agent = agent.reset_optimizers_with_lr()
         print("Reset optimizer with online learning rate")
 
-    # Resolve separate Q/Pi/V UTD ratios (default to utd_online)
+    # Separate Q/Pi/V UTD ratios (default to utd_online)
     eff_utd_q = utd_q if utd_q is not None else utd_online
     eff_utd_pi = utd_pi if utd_pi is not None else utd_online
     eff_utd_v = utd_v if utd_v is not None else eff_utd_q
@@ -460,7 +442,6 @@ def run_online_rl(
     elif eff_utd_q != utd_online:
         print(f"[UTD] critic={eff_utd_q}, actor={eff_utd_pi} per env step")
 
-    # Pre-compute invariants
     needs_batch_bc = algo_name in ALGORITHMS_WITH_BATCH_BC
     has_phases = algo_name in ALGORITHMS_WITH_PHASES
     needs_dual_eval = algo_name in ALGORITHMS_DUAL_EVAL
@@ -472,13 +453,10 @@ def run_online_rl(
     online_rng = jax.random.PRNGKey(seed + 40000)
     eval_flags = _build_eval_flags(n_eval_envs, eval_episodes, discount, run_name, env_name)
 
-    # === Phase-split q_warmup ===
-    # When q_warmup_steps > 0 and not resuming, run a dedicated collect-then-train
-    # phase before the main online loop: q_warmup_steps env steps with base actor
-    # (no BoN), then q_warmup_steps * utd_warmup critic updates back-to-back.
-    # start_training is bypassed for the warmed-up main loop.
-    # Phase-split is only safe when bc_refine is not set — otherwise we'd reverse
-    # the old order (BC-refine then q_warmup) by running warmup first.
+    # Phase-split q_warmup: a dedicated collect-then-train phase before the main
+    # online loop (collect env steps with the base actor, then run critic updates
+    # back-to-back). Only safe when bc_refine is not set, otherwise it would
+    # reverse the intended BC-refine-then-q_warmup ordering.
     do_phase_split_q_warmup = (
         has_phases and q_warmup_steps > 0 and bc_refine_steps == 0 and not is_resumed
     )
@@ -503,7 +481,7 @@ def run_online_rl(
             log_interval=log_interval, log_step=log_step,
             mesh=mesh, force_jax_sync=force_jax_sync,
         )
-        # Reset env for the main loop and zero out the warmup budget there.
+        # Reset env for the main loop and zero out the warmup budget there
         raw_ob, _ = env.reset(seed=seed + 10000 + 999999)
         ob, ob_images, ob_full_state = _split_obs(raw_ob)
         if encode_fn is not None and ob_images is not None:
@@ -518,7 +496,7 @@ def run_online_rl(
     q_warmup_end = start_training + bc_refine_steps + q_warmup_steps
     eval_start = q_warmup_end if has_phases else start_training
 
-    # Determine which policy to use for online rollouts
+    # Select the policy used for online rollouts
     if config.get('use_one_step_for_rollouts', False):
         if best_of_n > 1 and hasattr(agent, 'sample_actions_one_step_BON'):
             _actor_method_name = 'sample_actions_one_step_BON'
@@ -533,9 +511,6 @@ def run_online_rl(
     else:
         _actor_method_name = 'sample_actions'
 
-    # Introspect the rollout actor's kwarg set so we don't pass OGPO-only kwargs
-    # (images / full_state / is_encoded) to baselines whose sample_actions only
-    # accepts (observations, rng).
     _rollout_actor_supported = _actor_supported_kwargs(getattr(agent, _actor_method_name))
 
     start_online_step = 1
@@ -562,15 +537,12 @@ def run_online_rl(
                 actor_kwargs['images'] = ob_images
             if ob_full_state is not None:
                 actor_kwargs['full_state'] = ob_full_state
-            # Drop kwargs the rollout actor doesn't accept (baselines'
-            # sample_actions takes only (observations, rng)).
             actor_kwargs = _filter_actor_kwargs(actor_kwargs, _rollout_actor_supported)
             action = getattr(agent, _actor_method_name)(**actor_kwargs)
             for a in np.array(action).reshape(-1, action_dim):
                 action_queue.append(a)
         action = action_queue.pop(0)
 
-        # Environment step
         raw_next_ob, int_reward, terminated, truncated, info = env.step(action)
         next_ob, next_ob_images, next_ob_full_state = _split_obs(raw_next_ob)
         if encode_fn is not None and next_ob_images is not None:
@@ -593,9 +565,8 @@ def run_online_rl(
         if has_images:
             transition['images'] = ob_images
             transition['next_images'] = next_ob_images
-        # Only attach full_states when NOT pre-encoding: the encoded obs
-        # already folds full_state in, and the replay buffer schema won't
-        # have full_states keys.
+        # Attach full_states only when not pre-encoding: the encoded obs already
+        # folds full_state in and the buffer schema has no full_states keys.
         if ob_full_state is not None and encode_fn is None:
             transition['full_states'] = ob_full_state
             transition['next_full_states'] = next_ob_full_state
@@ -615,7 +586,7 @@ def run_online_rl(
             is_success = float(info.get('success', 0.0))
             score = is_success if is_success != 0 else 1e-9
 
-            # Compute MC returns for the trajectory (backward pass)
+            # MC returns via a backward pass over the trajectory
             if mc_regression:
                 G = 0.0
                 for t_idx in range(len(trajectory_buffer) - 1, -1, -1):
@@ -640,7 +611,6 @@ def run_online_rl(
             ob_images = next_ob_images
             ob_full_state = next_ob_full_state
 
-        # Training update
         if i < start_training:
             continue
 
@@ -650,14 +620,13 @@ def run_online_rl(
         if replay_buffer.size < batch_size * utd_ratio * horizon_length:
             continue
 
-        # Sample batch
         if needs_offline_data:
             batch = _sample_mixed_batch(replay_buffer, train_dataset, batch_size, utd_ratio,
                                         horizon_length, discount, offline_ratio)
         else:
             batch = _sample_online_batch(replay_buffer, batch_size, utd_ratio, horizon_length, discount)
 
-        # Success buffer: sample with utd_ratio (= max(utd_q, utd_pi)) so batch_update can slice per phase
+        # Sample success buffer at utd_ratio (= max(utd_q, utd_pi)) so batch_update can slice per phase
         batch_success = None
         success_flag = False
         if use_success_buffer:
@@ -696,13 +665,11 @@ def run_online_rl(
         if force_jax_sync:
             jax.block_until_ready(agent)
 
-        # Logging
         if i % log_interval == 0 and update_info:
             for key, info_dict in update_info.items():
                 logger.log(info_dict, key, step=log_step)
             update_info = {}
 
-        # Evaluation
         if i >= eval_start and (i == online_steps or (eval_interval > 0 and i % eval_interval == 0)):
             eval_step += 1
             gc.collect()
@@ -741,9 +708,7 @@ def run_online_rl(
                 except Exception:
                     pass
 
-            # Evaluate one-step policy if enabled
             if hasattr(agent, 'one_step_network') and agent.one_step_network is not None:
-                # Use BON version if best_of_n > 1 to match rollout behavior
                 one_step_actor_fn = agent.sample_actions_one_step_BON if best_of_n > 1 else agent.sample_actions_one_step
                 # Frozen-encoder runs: wrap so the env's raw obs gets re-encoded
                 # to match the dim the one-step MLP was init'd with.
@@ -762,12 +727,10 @@ def run_online_rl(
                 except Exception:
                     pass
 
-        # Memory monitoring (every eval or mem_log_interval steps)
         if i % mem_log_interval == 0:
             gc.collect()
             log_memory("online", step=log_step, logger=logger)
 
-        # Saving
         if log_enabled and save_interval > 0 and i % save_interval == 0:
             save_agent(agent, save_dir, log_step)
 

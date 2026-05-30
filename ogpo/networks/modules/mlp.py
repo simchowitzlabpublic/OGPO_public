@@ -7,27 +7,12 @@ from flax.linen import initializers
 
 
 def default_init(scale=1.0):
-    """Default weight initialization using variance scaling.
-
-    Args:
-        scale: Scaling factor for initialization.
-
-    Returns:
-        Initialization function.
-    """
+    """Default weight initialization using variance scaling."""
     return nn.initializers.variance_scaling(scale, 'fan_avg', 'uniform')
 
 
 class MLP(nn.Module):
-    """Multi-layer perceptron.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions.
-        activations: Activation function.
-        activate_final: Whether to apply activation to the final layer.
-        kernel_init: Kernel initializer.
-        layer_norm: Whether to apply layer normalization.
-    """
+    """Multi-layer perceptron."""
 
     hidden_dims: Sequence[int]
     activations: Any = nn.gelu
@@ -49,18 +34,7 @@ class MLP(nn.Module):
 
 
 class MLPCond(nn.Module):
-    """MLP with conditioning input repeated for each layer.
-
-    This MLP concatenates a conditioning vector to the input at each layer,
-    allowing the network to be modulated by external information.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions.
-        activations: Activation function.
-        activate_final: Whether to apply activation to the final layer.
-        kernel_init: Kernel initializer.
-        layer_norm: Whether to apply layer normalization.
-    """
+    """MLP that concatenates a conditioning vector to the input at each layer."""
 
     hidden_dims: Sequence[int]
     activations: Any = nn.gelu
@@ -82,29 +56,17 @@ class MLPCond(nn.Module):
 
 
 class MLPResidualBlock(nn.Module):
-    """Residual block with LayerNorm and GELU activation.
-
-    Attributes:
-        dim: Dimension of the block.
-        dropout: Dropout rate.
-    """
+    """Residual block with LayerNorm and GELU activation."""
     dim: int
     dropout: float = 0.0
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, deterministic: bool) -> jnp.ndarray:
-        """
-        Args:
-            x: The input tensor.
-            deterministic: If True, dropout is disabled.
-        """
         residual = x
 
-        # Define initializers
         ortho_init = initializers.orthogonal()
         zeros_init = initializers.constant(0.0)
 
-        # First sub-layer
         x = nn.LayerNorm()(x)
         x = nn.Dense(self.dim * 4,
                      kernel_init=ortho_init,
@@ -112,7 +74,6 @@ class MLPResidualBlock(nn.Module):
         x = nn.gelu(x)
         x = nn.Dropout(rate=self.dropout)(x, deterministic=deterministic)
 
-        # Second sub-layer
         x = nn.LayerNorm()(x)
         x = nn.Dense(self.dim,
                      kernel_init=ortho_init,
@@ -123,23 +84,7 @@ class MLPResidualBlock(nn.Module):
 
 
 class MLPWithFiLM(nn.Module):
-    """MLP with Feature-wise Linear Modulation (FiLM) conditioning.
-
-    This network is designed for diffusion models and includes time embedding
-    and conditioning support.
-
-    Attributes:
-        act_dim: Action dimension.
-        Ta: Action sequence length.
-        obs_dim: Observation dimension.
-        To: Observation sequence length.
-        emb_dim: Embedding dimension.
-        n_layers: Number of residual blocks.
-        timestep_emb_dim: Dimension of timestep embedding.
-        max_freq: Maximum frequency for sinusoidal time embedding.
-        disable_time_embedding: Whether to disable time embedding.
-        dropout: Dropout rate.
-    """
+    """MLP with FiLM conditioning and sinusoidal time embedding for diffusion models."""
     act_dim: int
     Ta: int
     obs_dim: int
@@ -191,25 +136,11 @@ class MLPWithFiLM(nn.Module):
         condition: Optional[jnp.ndarray],
         deterministic: bool
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Args:
-            x: (b, Ta, act_dim)
-            s: (b, )
-            t: (b, )
-            condition: (b, To, obs_dim) or None.
-            deterministic: If True, dropout is disabled.
-
-        Returns:
-            output_data: (b, Ta, act_dim)
-            scalar_output: (b, 1)
-        """
         x_flat = x.reshape(x.shape[0], -1)  # (b, Ta * act_dim)
 
-        # Handle condition - use zeros if None
         if condition is not None:
-            condition_flat = condition.reshape(condition.shape[0], -1) # (b, To * obs_dim)
+            condition_flat = condition.reshape(condition.shape[0], -1)  # (b, To * obs_dim)
         else:
-            # Create zeros for missing condition
             batch_size = x.shape[0]
             condition_flat = jnp.zeros((batch_size, self.To * self.obs_dim), dtype=x.dtype)
 
@@ -218,7 +149,6 @@ class MLPWithFiLM(nn.Module):
             t_embedded = self._embed_time(t)
             input_data = jnp.concatenate([x_flat, s_embedded, t_embedded, condition_flat], axis=-1)
         else:
-            # Skip time embeddings when disabled
             input_data = jnp.concatenate([x_flat, condition_flat], axis=-1)
 
         features = self.input_proj(input_data)
@@ -237,43 +167,22 @@ class MLPWithFiLM(nn.Module):
 
 
 class RSNorm(nn.Module):
-    """Running Statistics Normalization (RSNorm) layer.
-
-    This layer correctly handles state updates and distinguishes between
-    training and evaluation modes.
-
-    Attributes:
-        epsilon: Small constant for numerical stability.
-        momentum: Momentum for running statistics update.
-    """
+    """Running Statistics Normalization layer with train/eval modes."""
     epsilon: float = 1e-8
     momentum: float = 0.99
 
     @nn.compact
     def __call__(self, x, use_running_average: bool = False):
-        """
-        Applies running statistics normalization.
-
-        Args:
-            x: The input tensor.
-            use_running_average: If True, uses stored running statistics for
-                normalization (evaluation mode). If False, uses the current batch's
-                statistics and updates the running statistics (training mode).
-        """
-        # Define variables for running statistics in the 'batch_stats' collection.
         running_mean = self.variable('batch_stats', 'mean', lambda: jnp.zeros(x.shape[-1]))
         running_var = self.variable('batch_stats', 'var', lambda: jnp.ones(x.shape[-1]))
 
         if use_running_average:
-            # In evaluation mode, use the stored running averages.
             mean = running_mean.value
             var = running_var.value
         else:
-            # In training mode, use the statistics of the current batch.
             mean = jnp.mean(x, axis=0)
             var = jnp.var(x, axis=0)
 
-            # Update the running statistics if the 'batch_stats' collection is mutable.
             if self.is_mutable_collection('batch_stats'):
                 running_mean.value = self.momentum * running_mean.value + (1 - self.momentum) * mean
                 running_var.value = self.momentum * running_var.value + (1 - self.momentum) * var
@@ -282,18 +191,12 @@ class RSNorm(nn.Module):
 
 
 class SimBaInternalMLP(nn.Module):
-    """The internal MLP for a SimBa block with an inverted bottleneck.
-
-    Attributes:
-        hidden_dim: Hidden dimension.
-        kernel_init: Kernel initializer.
-    """
+    """Internal MLP for a SimBa block with an inverted bottleneck."""
     hidden_dim: int
     kernel_init: Any = default_init
 
     @nn.compact
     def __call__(self, x):
-        # Expands the hidden dimension to 4*d_h and applies ReLU
         intermediate_dim = self.hidden_dim * 4
         y = nn.Dense(intermediate_dim, kernel_init=self.kernel_init)(x)
         y = nn.relu(y)
@@ -302,19 +205,10 @@ class SimBaInternalMLP(nn.Module):
 
 
 class SimBaMLP(nn.Module):
-    """SimBa architecture that accepts a `hidden_dims` sequence like a standard MLP.
+    """SimBa architecture (RSNorm + residual feedforward blocks).
 
-    SimBa (Simple Baselines) is an architecture that uses running statistics normalization
-    and residual feedforward blocks for improved performance.
-
-    Attributes:
-        hidden_dims: Sequence of layer dimensions. The last element is the output size.
-                     All intermediate blocks will use the width of the first element.
-        activations: Activation function for the final layer (if activate_final is True).
-        activate_final: Whether to apply activation to the final output layer.
-        kernel_init: Kernel initializer for dense layers.
-        rs_norm_momentum: Momentum for the RSNorm layer.
-        rs_norm_epsilon: Epsilon for the RSNorm layer.
+    Accepts a `hidden_dims` sequence like a standard MLP; the last element is
+    the output size and intermediate blocks all use the width of the first.
     """
     hidden_dims: Sequence[int]
     activations: Any = nn.silu
@@ -328,32 +222,27 @@ class SimBaMLP(nn.Module):
         if not self.hidden_dims:
             raise ValueError("hidden_dims cannot be empty.")
 
-        # The main body of the network is defined by all but the last dimension
         main_body_dims = self.hidden_dims[:-1]
         output_dim = self.hidden_dims[-1]
 
-        # 1. Running Statistics Normalization on input
         x = RSNorm(
             momentum=self.rs_norm_momentum,
             epsilon=self.rs_norm_epsilon,
             name='RSNorm'
         )(x, use_running_average=not train)
 
-        # If there are no hidden layers specified, just project to the output
         if not main_body_dims:
             x = nn.Dense(output_dim, kernel_init=self.kernel_init)(x)
             if self.activate_final:
                 x = self.activations(x)
             return x
 
-        # Use the first dimension as the constant hidden dimension for all blocks
+        # All blocks share the width of the first hidden dimension.
         hidden_dim = main_body_dims[0]
         num_blocks = len(main_body_dims)
 
-        # 2. Initial Linear Embedding Layer
         x = nn.Dense(hidden_dim, kernel_init=self.kernel_init)(x)
 
-        # 3. Sequence of Residual Feedforward Blocks
         for i in range(num_blocks):
             residual = x
             x_norm = nn.LayerNorm(name=f'pre_ln_{i}')(x)
@@ -363,13 +252,10 @@ class SimBaMLP(nn.Module):
             )(x_norm)
             x = residual + mlp_output
 
-        # 4. Final Post-Layer Normalization
         x = nn.LayerNorm(name='post_ln')(x)
 
-        # Sow intermediates here, consistent with the original MLP's logic
         self.sow('intermediates', 'feature', x)
 
-        # 5. Final projection to the output dimension
         x = nn.Dense(output_dim, kernel_init=self.kernel_init)(x)
 
         if self.activate_final:

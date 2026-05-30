@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from einops import rearrange
 
 
-# Xavier uniform — matches PyTorch nn.Linear default and DiT
+# Xavier uniform — matches PyTorch nn.Linear default and DiT.
 def default_init(scale=1.0):
     return nn.initializers.variance_scaling(scale, 'fan_avg', 'uniform')
 
@@ -20,41 +20,18 @@ def zero_init():
 
 
 def modulate(x, shift, scale):
-    """AdaLN modulation: x * (1 + scale) + shift.
-
-    Args:
-        x: (batch, seq, features)
-        shift: (batch, features)
-        scale: (batch, features)
-    """
+    """AdaLN modulation: x * (1 + scale) + shift."""
     return x * (1 + scale[:, None]) + shift[:, None]
 
 
 class TimestepEmbedder(nn.Module):
-    """Sinusoidal timestep embedding + 2-layer MLP (DiT-style).
-
-    Maps scalar timesteps to dense vectors via sinusoidal positional encoding
-    followed by a learned MLP projection.
-
-    Attributes:
-        hidden_dim: Output dimension.
-        frequency_embedding_size: Dimension of the sinusoidal encoding.
-    """
+    """Sinusoidal timestep embedding + 2-layer MLP (DiT-style)."""
     hidden_dim: int
     frequency_embedding_size: int = 256
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        """Create sinusoidal timestep embeddings.
-
-        Args:
-            t: (N,) or (N, 1) tensor of timestep values (can be fractional).
-            dim: Output embedding dimension.
-            max_period: Controls minimum frequency.
-
-        Returns:
-            (N, dim) sinusoidal embedding.
-        """
+        """Create sinusoidal timestep embeddings."""
         t = jnp.ravel(t)  # ensure (N,)
         half = dim // 2
         freqs = jnp.exp(
@@ -78,11 +55,7 @@ class TimestepEmbedder(nn.Module):
 
 
 class ConditioningMLP(nn.Module):
-    """2-layer MLP with SiLU for conditioning projection (DiT-style).
-
-    Attributes:
-        hidden_dim: Output (and intermediate) dimension.
-    """
+    """2-layer MLP with SiLU for conditioning projection (DiT-style)."""
     hidden_dim: int
 
     @nn.compact
@@ -94,13 +67,7 @@ class ConditioningMLP(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention.
-
-    Attributes:
-        hidden_dim: Hidden dimension (must be divisible by num_heads).
-        num_heads: Number of attention heads.
-        dropout_rate: Dropout rate for attention weights.
-    """
+    """Multi-head self-attention."""
     hidden_dim: int
     num_heads: int
     dropout_rate: float = 0.0
@@ -132,14 +99,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Feedforward network.
-
-    Attributes:
-        hidden_dim: Input and output dimension.
-        ff_dim: Intermediate dimension.
-        dropout_rate: Dropout rate.
-        activation: Activation function.
-    """
+    """Feedforward network."""
     hidden_dim: int
     ff_dim: int
     dropout_rate: float = 0.0
@@ -159,13 +119,6 @@ class AdaLNLayer(nn.Module):
 
     Zero-initializes the adaLN modulation layer so that at init
     each block is an identity function.
-
-    Attributes:
-        hidden_dim: Hidden dimension.
-        num_heads: Number of attention heads.
-        ff_dim: Feedforward intermediate dimension.
-        dropout_rate: Dropout rate.
-        activation: Activation function for the feedforward network.
     """
     hidden_dim: int
     num_heads: int
@@ -185,7 +138,6 @@ class AdaLNLayer(nn.Module):
             jnp.split(adaLN_params, 6, axis=-1)
         )
 
-        # Attention branch
         norm_x = nn.LayerNorm(use_bias=False, use_scale=False, epsilon=1e-6)(x)
         modulated_x = modulate(norm_x, shift_msa, scale_msa)
         attn_output = MultiHeadAttention(
@@ -193,7 +145,6 @@ class AdaLNLayer(nn.Module):
         )(modulated_x, mask, deterministic)
         x = x + gate_msa[:, None] * attn_output
 
-        # FFN branch
         norm_x = nn.LayerNorm(use_bias=False, use_scale=False, epsilon=1e-6)(x)
         modulated_x = modulate(norm_x, shift_mlp, scale_mlp)
         ff_output = FeedForward(
@@ -206,12 +157,7 @@ class AdaLNLayer(nn.Module):
 
 
 class AdaLNFinalLayer(nn.Module):
-    """Final layer with adaLN + zero-initialized output projection.
-
-    Attributes:
-        hidden_dim: Hidden dimension.
-        output_dim: Output dimension.
-    """
+    """Final layer with adaLN + zero-initialized output projection."""
     hidden_dim: int
     output_dim: int
 
@@ -234,13 +180,7 @@ class AdaLNFinalLayer(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    """Cross-attention: Q from x, K/V from context.
-
-    Attributes:
-        hidden_dim: Hidden dimension (must be divisible by num_heads).
-        num_heads: Number of attention heads.
-        dropout_rate: Dropout rate for attention weights.
-    """
+    """Cross-attention: Q from x, K/V from context."""
     hidden_dim: int
     num_heads: int
     dropout_rate: float = 0.0
@@ -270,14 +210,7 @@ class CrossAttention(nn.Module):
 class CrossAttnLayer(nn.Module):
     """Pre-norm transformer layer with self-attention + cross-attention conditioning.
 
-    Replaces adaLN modulation (Dense D->6D) with cross-attention to context tokens.
-    3 sub-layers: causal self-attention, cross-attention, FFN.
-
-    Attributes:
-        hidden_dim: Hidden dimension.
-        num_heads: Number of attention heads.
-        ff_dim: Feedforward intermediate dimension.
-        dropout_rate: Dropout rate.
+    Three sub-layers: causal self-attention, cross-attention to context, FFN.
     """
     hidden_dim: int
     num_heads: int
@@ -286,21 +219,18 @@ class CrossAttnLayer(nn.Module):
 
     @nn.compact
     def __call__(self, x, context, mask=None, deterministic=True):
-        # Self-attention (causal)
         norm_x = nn.LayerNorm(epsilon=1e-6)(x)
         attn_output = MultiHeadAttention(
             self.hidden_dim, self.num_heads, self.dropout_rate
         )(norm_x, mask, deterministic)
         x = x + attn_output
 
-        # Cross-attention to conditioning context
         norm_x = nn.LayerNorm(epsilon=1e-6)(x)
         cross_output = CrossAttention(
             self.hidden_dim, self.num_heads, self.dropout_rate
         )(norm_x, context, deterministic)
         x = x + cross_output
 
-        # FFN
         norm_x = nn.LayerNorm(epsilon=1e-6)(x)
         ff_output = FeedForward(
             self.hidden_dim, self.ff_dim, self.dropout_rate
@@ -311,12 +241,7 @@ class CrossAttnLayer(nn.Module):
 
 
 class CrossAttnFinalLayer(nn.Module):
-    """Final layer for cross-attention transformer: LayerNorm + zero-init Dense.
-
-    Attributes:
-        hidden_dim: Hidden dimension.
-        output_dim: Output dimension.
-    """
+    """Final layer for cross-attention transformer: LayerNorm + zero-init Dense."""
     hidden_dim: int
     output_dim: int
 
@@ -332,16 +257,7 @@ class CrossAttnFinalLayer(nn.Module):
 
 
 class AdaLNTransformer(nn.Module):
-    """Complete DiT-style transformer with adaLN-Zero conditioning.
-
-    Attributes:
-        hidden_dim: Hidden dimension.
-        num_layers: Number of transformer layers.
-        num_heads: Number of attention heads.
-        ff_dim: Feedforward intermediate dimension.
-        output_dim: Output dimension.
-        dropout_rate: Dropout rate.
-    """
+    """Complete DiT-style transformer with adaLN-Zero conditioning."""
     hidden_dim: int
     num_layers: int
     num_heads: int

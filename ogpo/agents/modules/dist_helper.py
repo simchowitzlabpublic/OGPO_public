@@ -72,17 +72,12 @@ def hl_gauss_transform(
     num_bins: int,
     sigma: Optional[float] = None,
 ):
-    """
-    HL-Gauss: A numerically stable histogram loss transform for a truncated normal.
-    This is used for the cross-entropy loss for a distributional critic.
+    """HL-Gauss: numerically stable truncated-normal histogram transform for a distributional critic.
 
-    Usuage: forward_fn = lambda logits, target: cross_entropy(
-        logits, self.transform_to_probs(target)
-    )
+    Returns (transform_to_probs, transform_from_probs).
     """
     if sigma is None:
-        # set to default value suggested by the paper
-        # https://arxiv.org/pdf/2403.03950.pdf
+        # Default from https://arxiv.org/pdf/2403.03950.pdf
         sigma = 0.75 * (max_value - min_value) / num_bins
     support = jnp.linspace(min_value, max_value, num_bins + 1, dtype=jnp.float32)
 
@@ -107,13 +102,8 @@ def hl_gauss_transform(
 def cross_entropy_loss_on_scalar(
     logits: jax.Array, target: jax.Array, target_to_dist_fn: jax.Array
 ) -> jax.Array:
-    """
-    Compute the cross-entropy loss between the logits and the target distribution.
-    Turn the scalar target into a distributio with target_to_dist_fn.
-
-    logits: (n_ensemble, batch_size, n_bins)
-    target: (batch_size,)
-    """
+    """Cross-entropy between logits (n_ensemble, batch, n_bins) and a scalar target (batch,)
+    mapped to a distribution via target_to_dist_fn."""
     target_probs = jax.vmap(target_to_dist_fn, in_axes=0, out_axes=0,)(
         target
     )  # map over batch dimension

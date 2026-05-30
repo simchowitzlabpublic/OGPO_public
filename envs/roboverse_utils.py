@@ -32,16 +32,14 @@ class Roboverse(gym.ObservationWrapper):
         self.env_step = 0
 
     def observation(self, observation):
-        # out_dict = {}
         pixels = _process_image(observation['image'])
         return pixels
-    
+
     def reset(self, **kwargs):
         self.t = 0
         self.episode_return, self.episode_length = 0, 0
         self.n_episodes += 1
-        
-        # Override reset to ensure we get the full observation
+
         obs = self.env.reset(**kwargs)
         return self.observation(obs), {}
     
@@ -68,7 +66,6 @@ def make_env(env_name, seed=0):
     env = roboverse.make(env_name, transpose_image=True)
     env = Roboverse(env)
     dataset = get_dataset(env, env_name)
-    # env.seed(seed)
     return env
 
 def get_dataset(env, env_name):
@@ -80,7 +77,6 @@ def get_dataset(env, env_name):
         "out40.npy"
     )
     demos = np.load(dataset_path, allow_pickle=True)
-    # data holder
     observations = []
     actions = []
     next_observations = []
@@ -115,7 +111,6 @@ def get_dataset(env, env_name):
 
 
 if __name__ == "__main__":
-    # for testing
     env = make_env("PutBallintoBowl-v0")
     dataset = get_dataset(env, "PutBallintoBowl-v0")
     print(dataset)

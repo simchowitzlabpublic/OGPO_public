@@ -17,12 +17,7 @@ def get_dataset(
     env,
     env_name,
 ):
-    """Make D4RL dataset.
-
-    Args:
-        env: Environment instance.
-        env_name: Name of the environment.
-    """
+    """Make D4RL dataset."""
     dataset = d4rl.qlearning_dataset(env)
 
     terminals = np.zeros_like(dataset['rewards'])  # Indicate the end of an episode.

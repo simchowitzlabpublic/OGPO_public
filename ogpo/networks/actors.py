@@ -1,15 +1,4 @@
-"""Actor network implementations for reinforcement learning.
-
-This module contains various actor (policy) network architectures including:
-- Actor: Standard Gaussian policy with MLP backbone
-- ActorVectorField: Flow matching policy with optional FiLM conditioning
-- ActorVectorFieldTF: Transformer-based flow matching policy with AdaLN
-- ActorVectorFieldSimBa: SimBa architecture-based flow matching policy
-- EditPolicy: Simple Gaussian MLP policy for action refinement
-- EditActor: Edit actor for DSRL+EXPO that refines flow-refined actions
-
-All actors support optional encoders for observation processing.
-"""
+"""Actor (policy) network architectures: Gaussian, flow-matching, transformer, and edit policies."""
 
 from typing import Any, Optional, Sequence, Tuple
 
@@ -60,22 +49,7 @@ class TanhNormalDist:
 
 
 class Actor(nn.Module):
-    """Standard Gaussian policy with MLP backbone.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions for the MLP.
-        action_dim: Dimension of the action space.
-        layer_norm: Whether to apply layer normalization.
-        log_std_min: Minimum value for log standard deviation.
-        log_std_max: Maximum value for log standard deviation.
-        tanh_squash: Whether to apply tanh squashing to actions.
-        state_dependent_std: Whether standard deviation depends on state.
-        const_std: Whether to use constant (zero) standard deviation.
-        final_fc_init_scale: Initialization scale for final fully connected layers.
-        encoder: Optional encoder module for observations.
-        low: Lower bound for action space (used with tanh_squash).
-        high: Upper bound for action space (used with tanh_squash).
-    """
+    """Standard Gaussian policy with MLP backbone."""
     hidden_dims: Sequence[int]
     action_dim: int
     layer_norm: bool = False
@@ -138,19 +112,7 @@ class Actor(nn.Module):
 
 
 class ActorVectorField(nn.Module):
-    """Flow matching policy with optional FiLM conditioning.
-
-    This actor learns a vector field for flow matching policies.
-    Supports both standard MLP and FiLM-conditioned architectures.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions for the MLP.
-        action_dim: Dimension of the action space.
-        layer_norm: Whether to apply layer normalization.
-        encoder: Optional encoder module for observations.
-        use_film: Whether to use FiLM conditioning.
-        use_denoiser: Whether to include a denoiser output.
-    """
+    """Flow-matching policy (velocity field) with optional FiLM conditioning."""
     hidden_dims: Sequence[int]
     action_dim: int
     layer_norm: bool = False
@@ -214,13 +176,10 @@ class ActorVectorField(nn.Module):
         if not is_encoded and self.encoder is not None:
             observations = self.encode(observations, images)
 
-        # Two-tier obs encoder for frozen image features (L2-norm + dual-tower fusion).
-        # Operates on the flat pre-encoded obs vector; runs regardless of `is_encoded`
-        # because it normalizes the (already-encoded) image features for the trunk.
+        # Runs regardless of `is_encoded`: normalizes already-encoded image features.
         if self.obs_two_tier:
             observations = self.two_tier_encoder(observations)
 
-        # Embed timestep (sinusoidal or raw scalar)
         if times is not None and self.time_embedding is not None:
             times = self.time_embedding(times)
 
@@ -230,7 +189,6 @@ class ActorVectorField(nn.Module):
                 cond = jnp.concatenate([cond, times], axis=-1)
             if dt is not None:
                 cond = jnp.concatenate([cond, dt], axis=-1)
-            # Velocity output
             v = self.mlp(actions, cond)
         else:
             if times is None:
@@ -239,7 +197,6 @@ class ActorVectorField(nn.Module):
                 inputs = jnp.concatenate([observations, actions, times], axis=-1)
             if dt is not None:
                 inputs = jnp.concatenate([inputs, dt], axis=-1)
-            # Velocity output
             v = self.mlp(inputs)
 
         if return_denoiser:
@@ -256,25 +213,9 @@ class ActorVectorField(nn.Module):
 
 
 class ActorVectorFieldTF(nn.Module):
-    """Transformer flow matching policy with AdaLN conditioning.
+    """Transformer flow-matching policy with AdaLN or cross-attention conditioning.
 
-    Matches the original sbp_spl codebase architecture:
-    - Single Dense layer for conditioning projection (not ConditioningMLP)
-    - Single Dense layer for time/dt embedding (not sinusoidal TimestepEmbedder)
-    - No positional embeddings for action tokens
-    - No causal masking (fully bidirectional self-attention)
-    - Optional denoiser output head (new feature, kept)
-
-    Attributes:
-        hidden_dim: Hidden dimension size for transformer.
-        action_dim: Dimension of the action space.
-        action_chunk_size: Number of actions in a chunk (temporal dimension).
-        layer_norm: Whether to apply layer normalization.
-        encoder: Optional encoder module for observations.
-        num_layers: Number of transformer layers.
-        num_heads: Number of attention heads.
-        dropout_rate: Dropout rate for transformer.
-        use_denoiser: Whether to include a denoiser output head.
+    Bidirectional self-attention over action tokens, no positional embeddings.
     """
     hidden_dim: int
     action_dim: int
@@ -348,15 +289,13 @@ class ActorVectorFieldTF(nn.Module):
             cond = cond + dt_emb
 
         if self.conditioning_type == 'adaln':
-            # AdaLN: cond is (B, D), passed directly to each layer
             for layer in self.transformer_layers:
                 x = layer(x, cond, deterministic=deterministic)
             v = self.final_layer(x, cond)  # (B, T, action_dim)
             if self.use_denoiser:
                 z = self.denoiser_final_layer(x, cond)
         else:
-            # Cross-attn: form context tokens [state_token, time_token] -> (B, N, D)
-            # cond already has state + time summed into (B, D); expand to (B, 1, D)
+            # cond holds state + time summed into (B, D); expand to a single context token.
             context = cond[:, None, :]  # (B, 1, D)
             for layer in self.transformer_layers:
                 x = layer(x, context, deterministic=deterministic)
@@ -375,18 +314,7 @@ class ActorVectorFieldTF(nn.Module):
 
 
 class ActorVectorFieldSimBa(nn.Module):
-    """Actor using SimBa architecture for vector field prediction.
-
-    SimBa (Simple Baseline) architecture uses residual blocks with
-    running statistics normalization for improved training stability.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions for SimBa MLP.
-        action_dim: Dimension of the action space.
-        encoder: Optional encoder module for observations.
-        rs_norm_momentum: Momentum for running statistics normalization.
-        rs_norm_epsilon: Epsilon for numerical stability in normalization.
-    """
+    """Flow-matching policy using the SimBa architecture (residual blocks + running-stat norm)."""
     hidden_dims: Sequence[int]
     action_dim: int
     encoder: Optional[nn.Module] = None
@@ -412,11 +340,9 @@ class ActorVectorFieldSimBa(nn.Module):
         if not is_encoded and self.encoder is not None:
             observations = self.encode(observations, images)
 
-        # Embed timestep (sinusoidal or raw scalar)
         if times is not None and self.time_embedding is not None:
             times = self.time_embedding(times)
 
-        # Concatenate all inputs
         inputs = [observations, actions]
         if times is not None:
             inputs.append(times)
@@ -424,35 +350,21 @@ class ActorVectorFieldSimBa(nn.Module):
             inputs.append(dt)
 
         x = jnp.concatenate(inputs, axis=-1)
-
-        # Pass through SimBa MLP
         return self.simba_mlp(x)
 
 
 class EditPolicy(nn.Module):
-    """TanhNormal MLP policy that outputs an action edit (delta).
+    """TanhNormal MLP policy outputting an action edit (delta), conditioned on obs and base action.
 
-    Matches the reference EXPO implementation: unbounded Gaussian →
-    tanh squash to [-1, 1]. The caller scales by edit_action_scale
+    Unbounded Gaussian squashed to [-1, 1]; the caller scales by edit_action_scale
     and corrects the log-prob.
-
-    Conditioned on the observation and the base policy's action.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions for the MLP.
-        action_dim: Dimension of the action space.
-        encoder: Optional encoder module for observations.
-        log_std_min: Minimum value for log standard deviation.
-        log_std_max: Maximum value for log standard deviation.
-        edit_bound: Unused (kept for config compat); scaling done in agent.
-        layer_norm: Whether to apply layer normalization.
     """
     hidden_dims: Tuple[int, ...]
     action_dim: int
     encoder: nn.Module = None
     log_std_min: float = -20.0
     log_std_max: float = 2.0
-    edit_bound: float = 0.1
+    edit_bound: float = 0.1  # unused; kept for config compat (scaling done in agent)
     layer_norm: bool = True
     # Two-tier obs encoder (frozen-encoder image runs): see TwoTierObsEncoder.
     obs_two_tier: bool = False
@@ -510,22 +422,9 @@ class EditPolicy(nn.Module):
 
 
 class EditActor(nn.Module):
-    """Edit actor for DSRL+EXPO that refines flow-refined actions.
+    """Edit actor that outputs bounded residuals added to flow-refined base actions.
 
-    Conditioned on observations and base actions (output of flow refinement).
-    Outputs bounded residuals that are added to base actions.
-    Follows the EXPO paper's edit actor design adapted for DSRL's architecture.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions for the MLP.
-        action_dim: Dimension of the action space.
-        encoder: Optional encoder module for observations.
-        log_std_min: Minimum value for log standard deviation.
-        log_std_max: Maximum value for log standard deviation.
-        edit_action_scale: Maximum magnitude of edit residuals.
-        layer_norm: Whether to apply layer normalization.
-        state_dependent_std: Whether standard deviation depends on state.
-        final_fc_init_scale: Initialization scale for final fully connected layers.
+    Conditioned on observations and base actions; follows the EXPO edit-actor design.
     """
     hidden_dims: Sequence[int]
     action_dim: int
@@ -550,14 +449,12 @@ class EditActor(nn.Module):
                 proprio_dim=self.two_tier_proprio_dim,
                 fused_dim=fused,
             )
-        # MLP backbone
         self.edit_net = MLP(
             self.hidden_dims,
             activate_final=True,
             layer_norm=self.layer_norm
         )
 
-        # Output layers for mean and std
         self.mean_net = nn.Dense(
             self.action_dim,
             kernel_init=default_init(self.final_fc_init_scale)
@@ -576,27 +473,15 @@ class EditActor(nn.Module):
             )
 
     def __call__(self, observations, base_actions, is_encoded=False, temperature=1.0):
-        """Compute distribution over edit residuals.
-
-        Args:
-            observations: Current observations.
-            base_actions: Actions from flow refinement (noise → flow → base_actions).
-            is_encoded: Whether observations are already encoded.
-            temperature: Temperature for exploration.
-
-        Returns:
-            Distribution over edit residuals (will be scaled and added to base_actions).
-        """
+        """Return a distribution over edit residuals (scaled and added to base_actions)."""
         if self.encoder is not None and not is_encoded:
             observations = self.encoder(observations)
         if self.obs_two_tier:
             observations = self.two_tier_encoder(observations)
 
-        # Concatenate observations and base actions
         inputs = jnp.concatenate([observations, base_actions], axis=-1)
         outputs = self.edit_net(inputs)
 
-        # Compute mean and std
         means = self.mean_net(outputs)
 
         if self.state_dependent_std:
@@ -606,13 +491,12 @@ class EditActor(nn.Module):
 
         log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
 
-        # Create distribution - note we use TanhMultivariateNormalDiag to bound edits
         distribution = distrax.MultivariateNormalDiag(
             loc=means,
             scale_diag=jnp.exp(log_stds) * temperature
         )
 
-        # Apply tanh squashing to bound edits to [-edit_action_scale, +edit_action_scale]
+        # tanh-squash to bound edits to [-edit_action_scale, +edit_action_scale]
         distribution = TanhMultivariateNormalDiag(
             distribution,
             low=-self.edit_action_scale,

@@ -61,14 +61,10 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         rng: jnp.ndarray,
         is_encoded: bool = False,
     ) -> jnp.ndarray:
-        """
-        Compute actions via flow with gradient support.
-        This is the differentiable action sampling for BPTT.
-        """
+        """Differentiable flow action sampling for BPTT."""
         B = observations.shape[0]
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
 
-        # Encode observations if needed
         if self.config.encoder and not is_encoded:
             observations = self.actor_network(
                 method='call_submodule',
@@ -79,27 +75,22 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
             )
             is_encoded = True
 
-        # Initialize with random noise (stop gradient on noise so gradients only flow through policy)
+        # Stop gradient on the noise so gradients only flow through the policy
         actions = jax.lax.stop_gradient(jax.random.normal(rng, (B, act_dim)))
 
         if self.config.policy_type == 'mip':
-            # MIP mode
             t_0 = jnp.zeros((B, 1))
             a_0_hat = self.actor_network.select('actor')(observations, actions, t_0, params=grad_params, is_encoded=True)
             t_star = jnp.full((B, 1), self.config.mip_t_star)
             actions = self.actor_network.select('actor')(observations, a_0_hat, t_star, params=grad_params, is_encoded=True)
         else:
-            # Flow mode - deterministic integration (no noise injection for gradients)
+            # Deterministic flow integration (no noise injection for gradients)
             dt = 1.0 / self.config.flow_steps
             for i in range(self.config.flow_steps):
                 t = jnp.full((B, 1), i / self.config.flow_steps)
                 vels = self.actor_network.select('actor')(observations, actions, t, params=grad_params, is_encoded=True)
                 actions = actions + vels * dt
 
-                # No intermediate clipping in BPTT flow (matches old code)
-                # clip_intermediate_actions is only used in SDE paths
-
-        # Final clipping
         actions = jnp.clip(actions, self.config.act_min, self.config.act_max)
         return actions
 
@@ -111,16 +102,12 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         success_flag: bool,
         rng: jnp.ndarray
     ) -> Tuple[jnp.ndarray, dict]:
-        """
-        BPTT actor loss: Directly maximize Q(s, π(s)) by backpropping through Q into π.
-        """
-        # Subsample observations if needed
+        """BPTT actor loss: maximize Q(s, pi(s)) by backpropping through Q into pi."""
         obs = batch['observations']
         if self.config.ppo_batch_size < self.config.batch_size:
             rng, key = jax.random.split(rng)
             obs = jax.random.choice(key, obs, (self.config.ppo_batch_size,), replace=False)
 
-        # Encode observations once
         obs_encoded = None
         if self.config.encoder:
             obs_encoded = self.actor_network(
@@ -131,11 +118,9 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
                 params=grad_params,
             )
 
-        # Sample actions with gradient flow enabled
         rng, action_rng = jax.random.split(rng)
-        num_samples = self.config['bptt_num_samples']  # Fewer samples since we backprop
+        num_samples = self.config['bptt_num_samples']
 
-        # Generate multiple action samples with gradient support
         def sample_and_evaluate(rng_i):
             actions = self._compute_deterministic_flow_actions(
                 obs_encoded if self.config.encoder else obs,
@@ -144,7 +129,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
                 is_encoded=self.config.encoder
             )
 
-            # Compute Q-values with gradient flow
             if self.config.encoder:
                 critic_obs_enc = self.critic_network(
                     method='call_submodule',
@@ -156,7 +140,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
             else:
                 q_vals = self.critic_network.select('target_critic')(obs, actions)
 
-            # Aggregate Q-values
             if self.config['q_agg'] == 'min':
                 q = q_vals.min(axis=0)
             else:
@@ -164,15 +147,13 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
 
             return q, actions
 
-        # Vectorize over samples
         sample_rngs = jax.random.split(action_rng, num_samples)
         q_values_per_sample, actions_per_sample = jax.vmap(sample_and_evaluate)(sample_rngs)
 
-        # Compute policy loss: maximize Q-values (so minimize -Q)
+        # Maximize Q-values, i.e. minimize -Q
         q_values = q_values_per_sample.mean(axis=0)  # [batch_size]
         pg_loss = -jnp.mean(q_values)
 
-        # Optional BC regularization
         bc_loss = 0.0
         if self.config.use_bc_regularization:
             rng, key = jax.random.split(rng)
@@ -237,7 +218,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
 
     def get_td_loss(self, batch, batch_actions, next_actions, grad_params, rng, obs_encoded=None, next_obs_encoded=None):
         """Compute TD loss using q_helper functions."""
-        # Get next Q-values from target network
         if self.config.encoder:
             if next_obs_encoded is None:
                 next_obs_encoded = self.critic_network(
@@ -250,7 +230,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         else:
             next_qs = self.critic_network.select('target_critic')(batch['next_observations'], actions=next_actions)
 
-        # Aggregate next Q-values
         rng, agg_rng = jax.random.split(rng)
         next_q = aggregate_q_values(
             next_qs,
@@ -259,7 +238,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
             num_qs=self.config.num_qs,
         )
 
-        # Compute TD target
         target_q = compute_td_target(
             rewards=batch['rewards'],
             masks=batch['masks'],
@@ -268,7 +246,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
             horizon_length=self.config['horizon_length'],
         )
 
-        # Get current Q-values and compute loss
         if self.config["critic_loss_type"] == "hlgauss":
             if self.config.encoder:
                 if obs_encoded is None:
@@ -407,8 +384,8 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
             batch_actions = jnp.reshape(batch_bc["actions"], (batch_bc["actions"].shape[0], -1))
             next_actions = jnp.reshape(batch_bc["next_actions"], (batch_bc["next_actions"].shape[0], -1))
         else:
-            batch_actions = batch_bc["actions"][..., 0, :]  # take the first action
-            next_actions = batch_bc["next_actions"][..., 0, :]  # take the first action
+            batch_actions = batch_bc["actions"][..., 0, :]
+            next_actions = batch_bc["next_actions"][..., 0, :]
         rng, sample_rng = jax.random.split(rng)
 
         if self.config.encoder:
@@ -454,11 +431,10 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         if self.config["action_chunking"]:
             batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
         else:
-            batch_actions = batch["actions"][..., 0, :]  # take the first action
+            batch_actions = batch["actions"][..., 0, :]
 
         rng, sample_rng = jax.random.split(rng)
 
-        # Pre-encode observations if possible
         obs_encoded = None
         next_obs_encoded = None
         if self.config.encoder:
@@ -556,7 +532,7 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
 
     @staticmethod
     def _update_offline(agent, batch: dict) -> Tuple['OGPOBPTTAgent', dict]:
-        """Apply gradient update to both networks."""
+        """Offline BC update of the actor network."""
         new_rng, rng1 = jax.random.split(agent.rng, 2)
 
         if agent.config.useSimBa:
@@ -586,7 +562,7 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
 
     @staticmethod
     def _update_offline_calql(agent, batch: dict) -> Tuple['OGPOBPTTAgent', dict]:
-        """Apply gradient update to both networks."""
+        """Offline CalQL update of the critic network."""
         new_rng, rng1 = jax.random.split(agent.rng, 2)
 
         if agent.config.useSimBa:
@@ -620,11 +596,10 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
 
     @staticmethod
     def _update(agent, batch_tuple, success_flag) -> Tuple['OGPOBPTTAgent', dict]:
-        """Apply gradient update to both networks."""
+        """Apply gradient update to actor and critic networks."""
         batch, batch_bc, batch_success = batch_tuple
         new_rng, rng1, rng2 = jax.random.split(agent.rng, 3)
 
-        # Update actor network
         if agent.config.useSimBa:
             def actor_loss_fn(params, batch_stats):
                 variables = {'params': params, 'batch_stats': batch_stats}
@@ -643,12 +618,10 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
                 return agent.actor_total_loss(batch, batch_success, p, success_flag, rng1)
             new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
 
-        # Update actor target networks
         agent.target_update(new_actor_state, 'actor')
         if not agent.config.use_constant_noise:
             agent.target_update(new_actor_state, 'noise_net')
 
-        # Update critic network
         if agent.config.useSimBa:
             def critic_loss_fn(params, batch_stats):
                 variables = {'params': params, 'batch_stats': batch_stats}
@@ -667,7 +640,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
             new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
         agent.target_update(new_critic_state, 'critic')
 
-        # Combine info
         info = {**actor_info, **critic_info}
         return agent.replace(actor_network=new_actor_state, critic_network=new_critic_state, rng=new_rng), info
 
@@ -704,7 +676,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         """Apply BC loss update to actor network only using success buffer."""
         new_rng, rng1 = jax.random.split(agent.rng)
 
-        # Update actor network with BC loss only
         if agent.config.useSimBa:
             def actor_loss_fn(params, batch_stats):
                 variables = {'params': params, 'batch_stats': batch_stats}
@@ -725,7 +696,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
                 return bc_loss_val, info
             new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
 
-        # Update actor target networks
         agent.target_update(new_actor_state, 'actor')
         if not agent.config.use_constant_noise:
             agent.target_update(new_actor_state, 'noise_net')
@@ -763,18 +733,17 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         batch_size = observations.shape[0]
         num_samples = self.config.best_of_n
 
-        # 1. Generate all B*N candidate actions in one forward pass
+        # Generate all B*N candidate actions in one forward pass
         rng, action_key = jax.random.split(rng)
         obs_expanded = jnp.repeat(observations, num_samples, axis=0)  # [B*N, obs_dim]
         sampled_actions = self.sample_actions(obs_expanded, rng=action_key, is_encoded=False)
 
-        # 2. Evaluate Q-ensemble: (num_qs, B*N) → (num_qs, B, N)
+        # Evaluate Q-ensemble: (num_qs, B*N) -> (num_qs, B, N)
         q_ensemble = self.critic_network.select('target_critic')(
             obs_expanded, actions=sampled_actions, is_encoded=False
         )
         q_values = q_ensemble.reshape(self.config.num_qs, batch_size, num_samples)
 
-        # 3. Aggregate Q-ensemble per candidate (Python if — static at trace time)
         if self.config.subsample_bon:
             rng, sub_key = jax.random.split(rng)
             idxs = jax.random.randint(sub_key, (2, batch_size, num_samples), 0, self.config.num_qs)
@@ -783,7 +752,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         else:
             min_qs = jnp.min(q_values, axis=0)
 
-        # 4. Select the best candidate per observation
         best_idx = jnp.argmax(min_qs, axis=1)
         actions_reshaped = sampled_actions.reshape(batch_size, num_samples, -1)
         best_actions = jax.vmap(lambda a, i: a[i])(actions_reshaped, best_idx)
@@ -827,7 +795,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
 
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
 
-        # Create wrapper function for actor network
         def actor_fn(obs, actions, t, is_encoded=True):
             return self.actor_network.select(actor_module_name)(obs, actions, t, is_encoded=is_encoded)
 
@@ -851,7 +818,7 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
                 act_dim=act_dim,
                 act_min=self.config.act_min,
                 act_max=self.config.act_max,
-                clip_intermediate=False,  # Match old code: no intermediate clipping in ODE inference
+                clip_intermediate=False,
                 clip_value=self.config['denoised_clip_value'],
                 is_encoded=True,
             )
@@ -868,18 +835,14 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         rng: jnp.ndarray,
         obs_encoded: jnp.ndarray = None,
     ) -> Tuple[jnp.ndarray, dict]:
-        """Compute flow matching BC loss.
+        """Flow matching BC loss.
 
-        Supports two modes:
-        1. MIP mode: Two-term loss (regression at t=0 + denoising at t=t*)
-        2. Standard flow matching: Velocity prediction only
-
-        Uses bc_helper functions for common operations.
+        MIP mode uses a two-term loss (regression at t=0 + denoising at t=t*);
+        standard flow matching predicts velocity only.
         """
         batch_actions = preprocess_actions(batch, self.config["action_chunking"])
         batch_size = batch_actions.shape[0]
 
-        # Encoder handling
         if self.config.encoder and obs_encoded is None:
             obs_encoded = self.actor_network(
                 method='call_submodule', submodule='actor', submethod='encode',
@@ -890,18 +853,17 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         valid_mask = batch.get("valid", jnp.ones((batch_size, self.config["horizon_length"])))
 
         if self.config.policy_type == 'mip':
-            # ========== MIP Mode: Two-term loss (uses bc_helper) ==========
             x_0, x_t_star, t_0_arr, t_star_arr = get_mip_targets(
                 batch_actions, rng, self.config.mip_t_star
             )
 
-            # Term 1: Regression at t=0
+            # Regression at t=0
             pred_0 = self.actor_network.select('actor')(
                 actor_obs, x_0, t_0_arr, params=grad_params, is_encoded=self.config.encoder
             )
             loss_regression_raw = jnp.square(pred_0 - batch_actions)
 
-            # Term 2: Denoising at t=t*
+            # Denoising at t=t*
             pred_t_star = self.actor_network.select('actor')(
                 actor_obs, x_t_star, t_star_arr, params=grad_params, is_encoded=self.config.encoder
             )
@@ -931,7 +893,6 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
                 'bc_mip_loss_denoising': loss_denoising,
             }
         else:
-            # ========== Standard Flow Matching Mode ==========
             rng, targets_rng = jax.random.split(rng)
             x_t, vel, t = get_flow_targets(batch['observations'], batch_actions, targets_rng)
 
@@ -1064,13 +1025,12 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
         config['actor_backbone'] = a_backbone
         config['critic_backbone'] = c_backbone
 
-        # --- Time embedding ---
         time_emb_type = config.get('time_embedding', 'scalar')
         time_emb_module = None
         if time_emb_type == 'sinusoidal':
             time_emb_module = SinusoidalTimeEmbedding(embed_dim=config.get('time_embedding_dim', 32))
 
-        # --- Actor definition ---
+        # Actor definition
         if a_backbone == 'tf':
             actor_def = ActorVectorFieldTF(
                 hidden_dim=config.tf_pi_embed_dim,
@@ -1104,7 +1064,7 @@ class OGPOBPTTAgent(flax.struct.PyTreeNode):
                 time_embedding=time_emb_module,
             )
 
-        # --- Critic definition ---
+        # Critic definition
         if c_backbone == 'tf':
             critic_def = ValueTF(
                 hidden_dim=config.tf_q_embed_dim,

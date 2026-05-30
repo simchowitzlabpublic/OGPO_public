@@ -12,12 +12,8 @@ import jax.numpy as jnp
 class VisionProprioEncoder(nn.Module):
     """Encode images via ViT and concatenate with proprioceptive state.
 
-    Attributes:
-        vit: A MinViT (or compatible) image encoder module.
-        state_proj_dim: If > 0, project proprioception through a Dense layer
-                        before concatenation. If 0, concatenate raw state.
-        img_proj_dim: If > 0, project ViT features through Dense + LayerNorm
-                      before concatenation. Reduces 15k+ ViT dims to manageable size.
+    state_proj_dim / img_proj_dim, when > 0, project the respective modality
+    before concatenation (img projection also reduces the large ViT feature dim).
     """
     vit: nn.Module
     state_proj_dim: int = 0
@@ -26,15 +22,7 @@ class VisionProprioEncoder(nn.Module):
 
     @nn.compact
     def __call__(self, images, state):
-        """Encode images and state into a single flat feature vector.
-
-        Args:
-            images: Image observations, shape (B, H, W, C).
-            state: Proprioceptive state, shape (B, state_dim).
-
-        Returns:
-            Flat feature vector, shape (B, img_dim + state_dim).
-        """
+        """Encode images (B, H, W, C) and state (B, state_dim) into a flat vector."""
         img_features = self.vit(images)  # (B, num_patches * embed_dim) when flatten=True
         if self.freeze_backbone:
             img_features = jax.lax.stop_gradient(img_features)

@@ -63,7 +63,7 @@ def _get_task_config(env_name):
 
 
 def is_robomimic_env(env_name):
-    """determine if an env is robomimic"""
+    """Determine whether an env name refers to a robomimic environment."""
     try:
         if ("low_dim" not in env_name) and ("image" not in env_name):
             return False
@@ -96,9 +96,7 @@ def _get_max_episode_length(env_name):
 
 
 def make_env(env_name, seed=0, frame_stack=1, post_success_steps=0):
-    """
-    NOTE: should get_dataset() first, so that the metadata is downloaded before creating the environment
-    """
+    """Create a robomimic env. Call get_dataset() first so metadata is downloaded."""
     dataset_path = _check_dataset_exists(env_name)
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
     max_episode_length = _get_max_episode_length(env_name)
@@ -146,7 +144,6 @@ def make_env(env_name, seed=0, frame_stack=1, post_success_steps=0):
     return env
 
 def _check_dataset_exists(env_name):
-    # enforce that the dataset exists
     task, dataset_type, hdf5_type = env_name.split("-")
     if hdf5_type == "image":
         file_name = "image_v15.hdf5"
@@ -166,7 +163,6 @@ def _check_dataset_exists(env_name):
         dataset_type,
         file_name,
     )
-    # assert os.path.exists(dataset_path)
 
     return dataset_path
 
@@ -186,15 +182,12 @@ def get_dataset(env, env_name):
 
     print(f"the size of the dataset is {num_timesteps}")
 
-    # Check if this is an image environment
     is_image_env = "image" in env_name
 
-    # Use per-task keys
     image_keys = task_cfg['image_keys']
     proprio_keys = task_cfg['proprio_keys']
     task_low_dim_keys = task_cfg['low_dim_keys']
 
-    # Determine image frame-stack once (image envs only)
     num_stack = 1
     if is_image_env:
         current_env = env
@@ -223,16 +216,14 @@ def get_dataset(env, env_name):
     next_images_arr = None
     img_cursor = 0
 
-    # go through and add to the data holder
     for ep in demos:
         a = np.array(rm_dataset["data/{}/actions".format(ep)])
         dones = np.array(rm_dataset["data/{}/dones".format(ep)])
         r = np.array(rm_dataset["data/{}/rewards".format(ep)])
-        # Transform rewards from [0, 1] to [-1, 0]
-        r = r - 1.0
+        r = r - 1.0  # Transform rewards from [0, 1] to [-1, 0].
 
         if is_image_env:
-            # --- Load images (keep uint8; encoders normalize /255 internally) ---
+            # Keep images as uint8; encoders normalize /255 internally.
             img_obs_parts = [np.asarray(rm_dataset[f"data/{ep}/obs/{key}"]) for key in image_keys]
             img_next_parts = [np.asarray(rm_dataset[f"data/{ep}/next_obs/{key}"]) for key in image_keys]
             img_obs = np.concatenate(img_obs_parts, axis=3) if len(img_obs_parts) > 1 else img_obs_parts[0]
@@ -258,7 +249,6 @@ def get_dataset(env, env_name):
             img_cursor += n_ep
             del img_obs, img_next
 
-            # --- Load proprioceptive state ---
             state_obs = np.concatenate(
                 [np.array(rm_dataset[f"data/{ep}/obs/{k}"]) for k in proprio_keys], axis=-1)
             state_next = np.concatenate(
@@ -266,7 +256,7 @@ def get_dataset(env, env_name):
             observations.append(state_obs.astype(np.float32))
             next_observations.append(state_next.astype(np.float32))
 
-            # --- Load full low-dim state (for state-based critic) ---
+            # Full low-dim state for the state-based critic (includes object pose).
             full_state_obs = np.concatenate(
                 [np.array(rm_dataset[f"data/{ep}/obs/{k}"]) for k in task_low_dim_keys], axis=-1)
             full_state_next = np.concatenate(
@@ -274,7 +264,6 @@ def get_dataset(env, env_name):
             all_full_states.append(full_state_obs.astype(np.float32))
             all_next_full_states.append(full_state_next.astype(np.float32))
         else:
-            # Load low-dimensional observations
             obs, next_obs = [], []
             for k in task_low_dim_keys:
                 obs.append(np.array(rm_dataset[f"data/{ep}/obs/{k}"]))
@@ -309,8 +298,8 @@ def get_dataset(env, env_name):
 
 
 class RobomimicLowdimWrapper(gym.Env):
-    """
-    Environment wrapper for Robomimic environments with state observations.
+    """Wrapper for Robomimic environments with state observations.
+
     Modified from https://github.com/real-stanford/diffusion_policy/blob/main/diffusion_policy/env/robomimic/robomimic_lowdim_wrapper.py
     """
     def __init__(
@@ -343,7 +332,6 @@ class RobomimicLowdimWrapper(gym.Env):
         self.n_episodes = 0
         self.t_succ = None
 
-        # set up normalization
         self.normalize = normalization_path is not None
         if self.normalize:
             normalization = np.load(normalization_path)
@@ -352,7 +340,7 @@ class RobomimicLowdimWrapper(gym.Env):
             self.action_min = normalization["action_min"]
             self.action_max = normalization["action_max"]
 
-        # setup spaces - use [-1, 1]
+        # Spaces use [-1, 1].
         low = np.full(env.action_dimension, fill_value=-1.)
         high = np.full(env.action_dimension, fill_value=1.)
         self.action_space = Box(
@@ -550,7 +538,6 @@ class RobomimicImageWrapper(gym.Env):
             self.action_min = normalization["action_min"]
             self.action_max = normalization["action_max"]
 
-        # setup spaces
         low = np.full(env.action_dimension, fill_value=-1)
         high = np.full(env.action_dimension, fill_value=1)
         self.action_space = Box(
@@ -583,13 +570,11 @@ class RobomimicImageWrapper(gym.Env):
         return action * (self.action_max - self.action_min) + self.action_min
 
     def get_single_observation(self, raw_obs):
-        """Extract image, proprioception, and full low-dim state from raw robomimic observation.
+        """Extract image, proprioception, and full low-dim state from a raw obs.
 
-        Returns:
-            dict with 'state' (proprio vec), 'image' (HWC float32),
-            and 'full_state' (full low-dim state including object pose).
+        Returns a dict with 'state' (proprio vec), 'image' (HWC float32), and
+        'full_state' (full low-dim state including object pose).
         """
-        # Image
         img_parts = []
         for key in self.image_keys:
             if key in raw_obs:

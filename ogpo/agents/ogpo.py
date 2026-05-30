@@ -14,7 +14,7 @@ from ogpo.agents.modules.flax_utils import ModuleDict, TrainState, nonpytree_fie
 from ogpo.networks import (
     ActorVectorField, Value, ActorVectorFieldTF, ValueTF,
     ActorVectorFieldSimBa, ValueSimBa, NoiseInjectionNetwork,
-    OneStepPolicy,  # For FQL one-step policy
+    OneStepPolicy,
 )
 from ogpo.networks.modules.time_embedding import SinusoidalTimeEmbedding
 from ogpo.agents.modules.igp_targets_helper import get_flow_targets, get_shortcut_targets
@@ -70,16 +70,14 @@ def _split_keys(rng: jnp.ndarray, n: int) -> Tuple[jnp.ndarray, List[jnp.ndarray
 
 
 class OGPOAgent(flax.struct.PyTreeNode):
-    """ReinFlow: Fine-tuning Flow Matching Policy with Online Reinforcement Learning."""
+    """Online policy-gradient agent for fine-tuning flow-matching policies with RL."""
     rng: Any
     actor_network: TrainState
     critic_network: TrainState
     config: Any = nonpytree_field()
     pi_slow_params: Any = None
     chi_po_drift: Any = None  # scalar: latest mean chi2_ratio from actor, used by critic
-    one_step_network: Optional[TrainState] = None  # Optional: For FQL one-step policy
-
-    # --- Vision encoding helpers ---
+    one_step_network: Optional[TrainState] = None
 
     def _encode_for_actor(self, observations, images=None, params=None, use_target=False):
         """Encode observations for actor. Returns encoded obs (flat features)."""
@@ -114,31 +112,15 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return encoded
 
     def _critic_is_encoded(self):
-        """Whether critic receives pre-encoded observations.
-
-        True whenever critic_obs='image', because observations are always
-        pre-encoded before reaching the network (either by _encode_for_critic
-        or by pre-encoding when encoder is frozen).
-        """
+        """Whether critic receives pre-encoded observations (true when critic_obs='image')."""
         return self.config.get('critic_obs', 'state') == 'image'
 
     def _actor_is_encoded(self):
-        """Whether actor receives pre-encoded observations.
-
-        True whenever actor_obs='image', because observations are always
-        pre-encoded before reaching the network (either by _encode_for_actor
-        or by pre-encoding when encoder is frozen).
-        """
+        """Whether actor receives pre-encoded observations (true when actor_obs='image')."""
         return self.config.get('actor_obs', 'state') == 'image'
 
     def _get_critic_obs(self, batch):
-        """Get the right observations for the critic.
-
-        When critic was originally state-based (critic_obs=state), uses
-        full_states (23D) so the critic sees object pose info. This holds
-        even when the vision encoder is frozen (observations become 512D
-        embeddings for the actor, but the critic still needs raw full_states).
-        """
+        """Critic observations: full_states when critic_obs=state (sees object pose), else observations."""
         original = self.config.get('_original_critic_obs', self.config.get('critic_obs', 'state'))
         if original == 'state' and 'full_states' in batch:
             return batch['full_states']
@@ -173,16 +155,13 @@ class OGPOAgent(flax.struct.PyTreeNode):
         is_encoded: bool = False,
         images: jnp.ndarray = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Compute log-probabilities and optionally entropy using pg_helper functions.
-        """
+        """Compute log-probabilities and optionally entropy over the denoising chain."""
         actor_module_name = 'target_actor' if use_target else 'actor'
         noise_module_name = 'target_noise_net' if use_target else 'noise_net'
 
         if not is_encoded:
             observations = self._encode_for_actor(observations, images=images, params=params, use_target=use_target)
 
-        # Create wrapper functions for the network calls
         def actor_fn(obs, actions, t, params=None, is_encoded=True):
             return self.actor_network.select(actor_module_name)(obs, actions, t, params=params, is_encoded=is_encoded)
 
@@ -257,19 +236,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return actions, chains, old_lp, sigmas
 
     def _sample_next_actions_for_q(self, obs_encoded: jnp.ndarray, rng: jnp.ndarray, num_samples: int) -> jnp.ndarray:
-        """Sample multiple next actions for Q-target variance reduction.
-
-        Lightweight wrapper: only returns actions (discards chains, logprobs, sigmas).
-        Uses target policy with SDE sampling to match the standard action sampling path.
-
-        Args:
-            obs_encoded: Pre-encoded observations, shape (batch, obs_dim).
-            rng: Random key.
-            num_samples: Number of actions to sample per state (G).
-
-        Returns:
-            Sampled actions of shape (num_samples, batch, act_dim).
-        """
+        """Sample multiple next actions (target policy, SDE) for Q-target variance reduction. Returns (G, batch, act_dim)."""
         sample_rngs = jax.random.split(rng, num_samples)
 
         def sample_single(rng_g):
@@ -281,7 +248,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return jax.vmap(sample_single)(sample_rngs)
 
     def _sample_actions_ode(self, obs_encoded: jnp.ndarray, rng: jnp.ndarray, num_samples: int) -> jnp.ndarray:
-        """Sample actions from target policy via ODE (no logprob, no chains). For FPO."""
+        """Sample actions from target policy via ODE (no logprob, no chains)."""
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
 
         def actor_fn(obs, actions, t, is_encoded=True, return_denoiser=False):
@@ -336,12 +303,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return lp
 
     def _sample_from_ref(self, obs_encoded: jnp.ndarray, rng: jnp.ndarray) -> jnp.ndarray:
-        """Sample actions from the slow reference policy via SDE.
-
-        Unlike sample_actions_with_noise (which uses target_actor for stability),
-        this routes through select('actor') with pi_slow_params — the slow EMA
-        snapshot shared by chi_po, kl_reg, and fwd_kl_reg.
-        """
+        """Sample actions from the slow reference policy (pi_slow_params) via SDE."""
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
         ref_params = self.pi_slow_params
 
@@ -385,14 +347,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
     def _compute_fwd_kl_bc_loss(self, rng: jnp.ndarray, grad_params: flax.core.FrozenDict,
                                 batch: dict, obs_encoded: jnp.ndarray,
                                 images: jnp.ndarray = None) -> Tuple[jnp.ndarray, dict]:
-        """Forward KL surrogate via BC flow matching against slow-ref samples.
-
-        Sample a_ref ~ π_ref(·|s) (slow EMA), reshape to (B, H, A), then call
-        bc_loss with a synthetic batch so the standard flow matching machinery
-        regresses the *current* actor onto a_ref. Acts as KL(π_ref || π) — pulls
-        π toward covering all modes of π_ref. Counterpart of the reverse-KL
-        penalty (kl_reg) which uses log_ratio in the actor objective.
-        """
+        """Forward KL surrogate: BC flow matching of the current actor onto slow-ref samples (KL(pi_ref || pi))."""
         if self.pi_slow_params is None:
             return jnp.float32(0.0), {}
 
@@ -407,7 +362,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             actions_ref_3d = actions_ref.reshape(B, H, A)
         else:
             # bc_loss takes batch_actions[..., 0, :]; broadcast across H so any layout works.
-            actions_ref_3d = jnp.broadcast_to(actions_ref.reshape(B, 1, A), (B, H, A))
+            actions_ref_3d = jnp.broadcast_to(actions_ref.reshape(B, 1, A), (B, H, A))  # [B, H, A]
 
         fake_batch = {**batch, 'actions': actions_ref_3d}
         fake_batch['valid'] = jnp.ones((B, H))
@@ -428,14 +383,13 @@ class OGPOAgent(flax.struct.PyTreeNode):
         is_enc = self._critic_is_encoded()
 
         if self.config.get('use_mip_q', False):
-            # MIP-Q path: two-step sampling
             num_ensemble_members = self.config.get('num_ensemble_members', 10)
             noise_scale = self.config.get('mip_q_noise_scale', 1.0)
             mip_t_star = self.config.get('mip_q_t_star', 0.9)
             batch_size = critic_obs_enc.shape[0]
 
             if self.config.get('mip_q_ensemble', False):
-                # Explicit ensemble: Single noise for all actions (same noise for fair comparison)
+                # Single shared noise across actions for fair comparison.
                 rng, noise_rng = jax.random.split(rng)
                 noise_sample = jax.random.uniform(
                     noise_rng,
@@ -465,7 +419,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
                     return q_agg, q_vals
             else:
-                # Implicit ensemble: Multiple noises for all actions
                 rng, noise_rng = jax.random.split(rng)
                 noise_samples = jax.random.uniform(
                     noise_rng,
@@ -495,7 +448,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
                     return q_agg, q_vals
         else:
-            # Standard ensemble-Q path
             def compute_q_for_group(actions_g, rng_g):
                 q_vals = self.critic_network.select('target_critic')(critic_obs_enc, actions_g, is_encoded=is_enc)  # [M, batch]
 
@@ -556,11 +508,9 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return bc_loss
 
     def actor_loss(self, batch: dict, batch_success: dict, grad_params: flax.core.FrozenDict, success_flag: bool, rng: jnp.ndarray) -> Tuple[jnp.ndarray, dict]:
-        """ Compute PPO surrogate loss + entropy + BC regularization with OGPO advantage calculation. """
-        # Check if we should skip PG loss (for FQL mode)
+        """Compute PPO surrogate loss + entropy + BC regularization with OGPO advantage calculation."""
         skip_pg_loss = not self.config.get('fql_train_main_policy', True)
 
-        # Initialize default values for when PG is skipped
         pg_loss = jnp.float32(0.0)
         ent_loss = jnp.float32(0.0)
         ent = jnp.float32(0.0)
@@ -575,7 +525,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         G = self.config.group_num_samples
 
         if not skip_pg_loss:
-            # Subsample observations if needed
             obs = batch['observations']
             images = batch.get('images')
             c_obs = self._get_critic_obs(batch)
@@ -595,13 +544,12 @@ class OGPOAgent(flax.struct.PyTreeNode):
             rng, sample_rng = jax.random.split(rng)
 
             if self.config.get('use_awr', False):
-                # ===== AWR PATH (Advantage-Weighted Regression for Flow Matching) =====
                 actions = self._sample_actions_ode(obs_encoded, sample_rng, G)  # [G, batch, act_dim]
 
                 def new_actor_fn(obs_a, x_tau, t):
                     return self.actor_network.select('actor')(obs_a, x_tau, t, params=grad_params, is_encoded=True)
 
-                # Advantages: chi²-penalized or standard
+                # Advantages: chi2-penalized or standard
                 rng, adv_rng = jax.random.split(rng)
                 info_extra = {}
                 if self.config.get('chi_po', False) and self.pi_slow_params is not None:
@@ -653,7 +601,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 pg_stats['approx_kl'] = jnp.float32(0.0)
 
             elif self.config.get('use_fpo', False):
-                # ===== FPO PATH =====
                 actions = self._sample_actions_ode(obs_encoded, sample_rng, G)  # [G, batch, act_dim]
 
                 def old_actor_fn(obs_a, x_tau, t):
@@ -661,7 +608,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 def new_actor_fn(obs_a, x_tau, t):
                     return self.actor_network.select('actor')(obs_a, x_tau, t, params=grad_params, is_encoded=True)
 
-                # Advantages: chi²-penalized or standard
+                # Advantages: chi2-penalized or standard
                 rng, adv_rng = jax.random.split(rng)
                 info_extra = {}
                 if self.config.get('chi_po', False) and self.pi_slow_params is not None:
@@ -694,12 +641,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     )
                 ratio_rngs = jax.random.split(ratio_rng, G)
                 ratios, fpo_stats = jax.vmap(compute_ratio_single)(actions, ratio_rngs)
-                # ratios: [G, n_mc, batch] if per_sample, [G, batch] if not
+                # ratios: [G, n_mc, batch] if per_sample, else [G, batch]
 
-                # Step 4: PPO loss with FPO ratios
                 adv_flat = adv.reshape(-1)  # [G * batch]
                 if self.config.fpo_per_sample:
-                    # Reshape: [G, n_mc, batch] -> [n_mc, G*batch]
+                    # [G, n_mc, batch] -> [n_mc, G*batch]
                     n_mc = self.config.fpo_n_mc
                     ratios_reshaped = ratios.transpose(1, 0, 2).reshape(n_mc, -1)
                     pg_loss, pg_stats = compute_fpo_ppo_loss(
@@ -724,7 +670,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 lp = jnp.float32(0.0)
                 old_lp = jnp.float32(0.0)
 
-                # Merge FPO-specific stats into pg_stats
                 pg_stats.update({f'fpo_{k}': v.mean() if hasattr(v, 'mean') else v for k, v in fpo_stats.items()})
 
             elif self.config.get('chi_po', False) or self.config.get('kl_reg', False):
@@ -737,7 +682,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 chi2_ratio = jax.lax.stop_gradient(jnp.exp(log_ratio_raw)) if chi_po_on else None
                 log_ratio = log_ratio_raw if kl_reg_on else None
 
-                # 4. Q-values and regularized advantages (chi_po and/or kl_reg)
+                # Q-values and regularized advantages (chi_po and/or kl_reg)
                 rng, adv_rng = jax.random.split(rng)
                 q_agg, q_full = self._compute_q_values(obs, actions, adv_rng, images=images, critic_obs=c_obs, critic_images=c_images)
                 beta = compute_chi_po_beta(q_full, self.config) if chi_po_on else None
@@ -747,7 +692,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     log_ratio=log_ratio, beta_kl=beta_kl,
                 )
 
-                # 5. PPO loss (PPO ratio = exp(lp - old_lp), has gradients)
+                # PPO loss (PPO ratio = exp(lp - old_lp), has gradients)
                 lp_flat = lp.reshape(-1)
                 old_lp_flat = old_lp.reshape(-1)
                 adv_flat = adv.reshape(-1)
@@ -769,13 +714,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     info_extra['kl_reg_log_ratio_std'] = log_ratio.std()
                     info_extra['kl_reg_log_ratio_max'] = log_ratio.max()
 
-                # Flatten for downstream (BC reg etc.)
                 lp = lp_flat
                 old_lp = old_lp_flat
                 adv = adv_flat
 
             else:
-                # ===== ORIGINAL OGPO PATH (unchanged) =====
                 actions, chains, old_lp, sigmas = self._sample_actions(obs, sample_rng, use_target=True, num_samples=G, obs_encoded=obs_encoded, images=images)
 
                 rng, adv_rng = jax.random.split(rng)
@@ -804,8 +747,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
             bc_loss = self._compute_bc_loss(rng, grad_params, batch, batch_success, success_flag, obs_encoded=batch_obs_encoded, batch_success_encoded=batch_success_encoded, images=batch_images, images_success=batch_success_images)
 
-        # Forward-KL regularization: BC flow-matching loss against samples from
-        # the slow reference policy (KL(π_ref || π) surrogate).
+        # Forward-KL regularization: BC flow-matching against slow-ref samples.
         fwd_kl_loss = jnp.float32(0.0)
         fwd_kl_info = {}
         if self.config.get('fwd_kl_reg', False) and self.pi_slow_params is not None:
@@ -850,9 +792,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             **fwd_kl_info,
         }
 
-        # Pass drift statistic to critic for pessimism blending.
-        # chi_po wins if both active — critic applies sigmoid(alpha*(drift-1)) for chi2,
-        # sigmoid(alpha*drift) for log_ratio.
+        # Drift statistic passed to critic for pessimism blending (chi_po takes priority if both active).
         if self.config.get('chi_po', False):
             info['_chi2_ratio'] = chi2_ratio  # [G, batch], not logged, used by critic
         elif self.config.get('kl_reg', False):
@@ -866,12 +806,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if next_q_override is not None:
             next_q = next_q_override
         else:
-            # Get next Q-values from target network
             if next_obs_encoded is None:
                 next_obs_encoded = self._encode_for_critic(self._get_critic_next_obs(batch), images=next_images, use_target=True)
 
             if self.config.get('use_mip_q', False):
-                # MIP-Q path: two-step sampling (like MIP actor)
                 num_ensemble_members = self.config.get('num_ensemble_members', 10)
                 noise_scale = self.config.get('mip_q_noise_scale', 1.0)
                 mip_t_star = self.config.get('mip_q_t_star', 0.9)
@@ -916,7 +854,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     num_qs=num_ensemble_members,
                 )
             else:
-                # Original ensemble-Q path
                 next_qs = self.critic_network.select('target_critic')(next_obs_encoded, actions=next_actions, is_encoded=is_enc)
 
                 rng, agg_rng = jax.random.split(rng)
@@ -927,7 +864,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     num_qs=self.config.num_qs,
                 )
 
-        # Compute TD target
         target_q = compute_td_target(
             rewards=batch['rewards'],
             masks=batch['masks'],
@@ -936,13 +872,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
             horizon_length=self.config['horizon_length'],
         )
 
-        # Get current Q-values and compute loss
         if obs_encoded is None:
             obs_encoded = self._encode_for_critic(self._get_critic_obs(batch), images=images, params=grad_params)
 
         if self.config.get('use_mip_q', False):
-            # MIP-Q: Use centralized training function
-            # Create critic function wrapper that includes params
             critic_base_fn = self.critic_network.select('critic')
             def critic_fn_with_params(obs, actions, scalar_input, time, is_encoded, return_logits):
                 return critic_base_fn(
@@ -951,7 +884,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 )
 
             if self.config.get('mip_q_ensemble', False):
-                # Explicit ensemble: Use compute_mip_q_ensemble_predictions
                 if self.config["critic_loss_type"] == "hlgauss":
                     q_0, q, q_0_logits, q_logits = compute_mip_q_ensemble_predictions(
                         critic_fn=critic_fn_with_params,
@@ -979,7 +911,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     q_0_logits = None
                     q_logits = None
             else:
-                # Implicit ensemble: Use compute_mip_q_predictions
                 if self.config["critic_loss_type"] == "hlgauss":
                     q_0, q, q_0_logits, q_logits = compute_mip_q_predictions(
                         critic_fn=critic_fn_with_params,
@@ -1009,7 +940,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     q_0_logits = None
                     q_logits = None
         else:
-            # Original ensemble-Q path
             if self.config["critic_loss_type"] == "hlgauss":
                 q, q_logits = self.critic_network.select('critic')(
                     obs_encoded, actions=batch_actions,
@@ -1022,19 +952,14 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 )
                 q_logits = None
 
-        # Compute loss
-        # At this point:
-        # - Ensemble-Q: q shape is [num_qs, batch_size]
-        # - MIP-Q: q shape is [num_ensemble_members, batch_size], q_0 shape is [num_ensemble_members, batch_size]
-        # - target_q shape is [batch_size] for both
+        # q: [num_qs/num_ensemble_members, batch_size]; target_q: [batch_size]
         valid = batch.get('valid')
         if valid is not None and valid.ndim > 1:
             valid = valid[..., -1]
 
         if self.config.get('use_mip_q', False):
-            # MIP-Q: Two-term loss (regression at t=0 + denoising at t=t*)
+            # MIP-Q two-term loss: regression at t=0 + denoising at t=t*
             if self.config["critic_loss_type"] == "hlgauss":
-                # Loss at t=0 (regression term)
                 td_loss_0, stats_0 = compute_td_loss(
                     q_pred=q_0,
                     target_q=target_q,
@@ -1045,7 +970,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     num_bins=self.config['num_bins'],
                     q_logits=q_0_logits,
                 )
-                # Loss at t=t* (denoising term)
                 td_loss_t_star, stats_t_star = compute_td_loss(
                     q_pred=q,
                     target_q=target_q,
@@ -1057,14 +981,12 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     q_logits=q_logits,
                 )
             else:
-                # Loss at t=0 (regression term)
                 td_loss_0, stats_0 = compute_td_loss(
                     q_pred=q_0,
                     target_q=target_q,
                     valid_mask=valid,
                     loss_type="mse",
                 )
-                # Loss at t=t* (denoising term)
                 td_loss_t_star, stats_t_star = compute_td_loss(
                     q_pred=q,
                     target_q=target_q,
@@ -1072,10 +994,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     loss_type="mse",
                 )
 
-            # Combined MIP loss (like MIP actor BC loss)
             td_loss = td_loss_0 + td_loss_t_star
 
-            # Combine stats
             stats = {
                 'td_loss': td_loss,
                 'td_loss_regression_t0': td_loss_0,
@@ -1084,7 +1004,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 **{f'q_tstar_{k}': v for k, v in stats_t_star.items()},
             }
         else:
-            # Original ensemble-Q path: single loss
             if self.config["critic_loss_type"] == "hlgauss":
                 td_loss, stats = compute_td_loss(
                     q_pred=q,
@@ -1113,8 +1032,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             obs_encoded = self._encode_for_critic(self._get_critic_obs(batch), images=images, params=grad_params)
         q_pred = self.critic_network.select('critic')(obs_encoded, actions=batch_actions, params=grad_params, is_encoded=is_enc)
 
-        # CQL Part: sample actions from current policy
-        # Pre-encode observations for the actor so sample_actions doesn't need raw images
+        # Sample actions from current policy (pre-encode obs so sample_actions skips raw images)
         actor_images = batch.get('images')
         actor_obs_encoded = self._encode_for_actor(batch['observations'], images=actor_images, use_target=True)
         next_actor_images = batch.get('next_images')
@@ -1148,8 +1066,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
         subsample_idcs = jax.random.randint(subsample_key, (self.config.calql_q_subsample,), 0, self.config.num_qs,)
         cql_qs = cql_qs[subsample_idcs]
         q_pred = q_pred[subsample_idcs]
-        
-        # CalQL Part
+
+        # CalQL lower bound: clamp OOD Q-values to MC returns.
         n_actions_for_calql = self.config.cql_n_actions * 3
         mc_lower_bound = jnp.repeat(batch["mc_returns"].reshape(-1, 1), n_actions_for_calql, axis=1,)
         cql_qs = jnp.maximum(cql_qs, mc_lower_bound)
@@ -1166,8 +1084,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
             batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
             next_actions = jnp.reshape(batch["next_actions"], (batch["next_actions"].shape[0], -1))
         else:
-            batch_actions = batch["actions"][..., 0, :] # take the first action
-            next_actions = batch["next_actions"][..., 0, :] # take the first action
+            batch_actions = batch["actions"][..., 0, :]
+            next_actions = batch["next_actions"][..., 0, :]
         rng, sample_rng = jax.random.split(rng)
 
         images = self._get_critic_images(batch)
@@ -1212,7 +1130,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             obs_encoded=obs_encoded, next_obs_encoded=next_obs_encoded,
             images=images, next_images=next_images)
 
-        # MC regression: ||Q(s,a) - MC_return||²
         mc_loss = compute_mc_regression_loss(q, batch['mc_returns'])
         total_loss = td_loss + self.config.mc_regression_coeff * mc_loss
 
@@ -1272,19 +1189,15 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
         rng, sample_rng = jax.random.split(rng)
 
-        # Critic uses full_states when critic_obs=state in image envs
         c_images = self._get_critic_images(batch)
         c_next_images = self._get_critic_next_images(batch)
 
-        # Pre-encode observations for critic
         obs_encoded = self._encode_for_critic(self._get_critic_obs(batch), images=c_images, params=grad_params)
         next_obs_encoded = self._encode_for_critic(self._get_critic_next_obs(batch), images=c_next_images, use_target=True)
 
-        # Sample next actions from target actor (actor uses proprio + images)
         actor_next_images = batch.get('next_images')
         next_actor_obs_encoded = self._encode_for_actor(batch['next_observations'], images=actor_next_images, use_target=True)
 
-        # One-step policy for TD targets (FQL)
         if self.config.get('use_one_step_for_targets', False) and self.one_step_network is not None:
             next_actions = self.sample_actions_one_step(next_actor_obs_encoded, rng=sample_rng, is_encoded=True)
             td_loss, q, next_q, stats = self.get_td_loss(batch, batch_actions, next_actions, grad_params, rng, obs_encoded=obs_encoded, next_obs_encoded=next_obs_encoded, images=c_images, next_images=c_next_images)
@@ -1297,7 +1210,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             }
 
         if self.config.get('use_value_fn', False):
-            # --- V(s')-based Q-target path: no next-action denoising for the critic bootstrap ---
+            # V(s')-based Q-target: no next-action denoising for the critic bootstrap.
             is_enc = self._critic_is_encoded()
             next_v_ens = self.critic_network.select('target_value')(
                 next_obs_encoded, is_encoded=is_enc
@@ -1324,7 +1237,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     obs_encoded, params=grad_params, is_encoded=is_enc
                 )  # (num_v, B)
                 if v_pair:
-                    # Each V_i bootstraps from its own target_V_i(s')
+                    # Each V_i bootstraps from its own target_V_i(s').
                     next_v_per_head = jax.lax.stop_gradient(next_v_ens)  # (num_v, B)
                     v_target = compute_td_target(
                         rewards=batch['rewards'],
@@ -1345,7 +1258,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     v_loss = jnp.mean(jnp.square(v_pred - v_target[None, :]))
                 v_sup_info = {}
             elif v_training_mode == 'bc_q_mean':
-                # Regress V(s') onto mean_{a'~π} Q(s', a') from a G-sample ensemble evaluation
+                # Regress V(s') onto mean_{a'~pi} Q(s', a') over a G-sample ensemble.
                 G = self.config.get('q_vr_num_samples', 8)
                 rng, sample_rng_v = jax.random.split(rng)
                 next_actions_group = self._sample_next_actions_for_q(
@@ -1360,7 +1273,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                     next_obs_encoded, params=grad_params, is_encoded=is_enc
                 )  # (num_v, B)
                 if v_pair:
-                    # V_i supervised by mean_{a'} Q_i(s', a')
+                    # V_i supervised by mean_{a'} Q_i(s', a').
                     q_mean_per_head = reduce_q_over_samples(next_qs_group, 'mean')  # (num_qs, B)
                     v_loss = jnp.mean(jnp.square(v_pred_next - jax.lax.stop_gradient(q_mean_per_head)))
                     v_sup_info = {'v_bc_q_mean_target': q_mean_per_head.mean()}
@@ -1382,7 +1295,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             }
 
         if self.config.get('q_variance_reduction', False):
-            # --- Variance-reduced Q-target path ---
             G = self.config['q_vr_num_samples']
 
             next_actions_group = self._sample_next_actions_for_q(
@@ -1426,7 +1338,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 **stats,
             }
         else:
-            # --- Original code path ---
             next_actions = self.sample_actions(next_actor_obs_encoded, rng=sample_rng, is_encoded=True)
 
             chi_po_on = self.config.get('chi_po', False)
@@ -1507,11 +1418,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         c_loss, c_info = self.critic_loss(batch, grad_params, rng)
         info = {f'critic/{k}': v for k,v in c_info.items()}
 
-        # Optional MC regression: ||Q(s,a) - MC_return||^2, toggled by the
-        # mc_regression flag. Applied uniformly wherever the critic trains via
-        # critic_total_loss — q-warmup AND online RL. Needs batch['mc_returns'],
-        # which the online replay buffer populates when mc_regression is on
-        # (see online_rl_runner: per-trajectory backward discounted sum).
+        # Optional MC regression: ||Q(s,a) - MC_return||^2; needs batch['mc_returns'].
         if self.config.get('mc_regression', False) and 'mc_returns' in batch:
             is_enc = self._critic_is_encoded()
             obs_encoded = self._encode_for_critic(
@@ -1536,7 +1443,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
     def _update_offline(agent, batch: dict) -> Tuple['OGPOAgent', dict]:
         new_rng, rng1 = jax.random.split(agent.rng, 2)
 
-        # Update flow policy with BC loss
         if agent.config.useSimBa:
             def actor_loss_fn(params, batch_stats):
                 variables = {'params': params, 'batch_stats': batch_stats}
@@ -1559,8 +1465,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if not agent.config.use_constant_noise:
             agent.target_update(new_actor_state, 'noise_net')
 
-        # Update one-step policy with distillation loss (if enabled)
-        # During BC training, only use distillation (no Q-maximization since critic is untrained)
+        # One-step policy: distillation only during BC (critic untrained, no Q-maximization).
         one_step_info = {}
         new_one_step_state = agent.one_step_network
         if agent.one_step_network is not None and agent.config.get('train_one_step_in_offline', True):
@@ -1568,11 +1473,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
             def one_step_loss_fn(p):
                 return agent.one_step_distillation_loss(batch, p, rng2, use_q_loss=0.0)
             new_one_step_state, one_step_info = agent.one_step_network.apply_loss_fn(one_step_loss_fn)
-            # Update target network
             agent.target_update(new_one_step_state, 'one_step')
 
         bc_info = {**actor_info, **one_step_info}
-        new_rng, _ = jax.random.split(agent.rng)  # match main: re-split from agent.rng (same as the first split's new_rng)
+        new_rng, _ = jax.random.split(agent.rng)
         return agent.replace(actor_network=new_actor_state, one_step_network=new_one_step_state, rng=new_rng), bc_info
     
     @staticmethod
@@ -1632,8 +1536,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         batch, batch_success = batch_tuple
         new_rng, rng1, rng2 = jax.random.split(agent.rng, 3)
 
-        # Update actor network
-
         if agent.config.useSimBa:
             def actor_loss_fn(params, batch_stats):
                 variables = {'params': params, 'batch_stats': batch_stats}
@@ -1652,10 +1554,9 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 return agent.actor_total_loss(batch, batch_success, p, success_flag, rng1)
             new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
 
-        # Update actor target networks
         agent.target_update(new_actor_state, 'actor')
         agent.pi_slow_update(new_actor_state)
-        # Update chi_po_drift scalar: chi2_ratio (chi_po) or log_ratio (kl_reg only)
+        # chi_po_drift = mean chi2_ratio (chi_po) or log_ratio (kl_reg only)
         if agent.config.get('chi_po', False):
             agent = agent.replace(chi_po_drift=actor_info['actor/_chi2_ratio'].mean())
         elif agent.config.get('kl_reg', False):
@@ -1663,7 +1564,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if not agent.config.use_constant_noise:
             agent.target_update(new_actor_state, 'noise_net')
 
-        # Update critic network
         use_sb_q = agent.config.get('use_success_buffer_q', False)
 
         if agent.config.useSimBa:
@@ -1690,8 +1590,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
             agent._critic_target_update(new_critic_state)
 
-        # Update one-step policy with Q-maximization + distillation (if enabled)
-        # During online training, use both Q-loss and distillation since critic is trained
+        # One-step policy: Q-maximization + distillation (critic is trained online).
         one_step_info = {}
         new_one_step_state = agent.one_step_network
         if agent.one_step_network is not None and agent.config.get('train_one_step_in_online', True):
@@ -1699,13 +1598,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
             def one_step_loss_fn(p):
                 return agent.one_step_distillation_loss(batch, p, rng3, use_q_loss=1.0)
             new_one_step_state, one_step_info = agent.one_step_network.apply_loss_fn(one_step_loss_fn)
-            # Update target network
             agent.target_update(new_one_step_state, 'one_step')
 
-        # Add learning rate information
-        # lr_info = agent._get_lr_info(new_actor_state, new_critic_state)
-
-        # Combine info
         info = {**actor_info, **critic_info, **one_step_info}
         return agent.replace(actor_network=new_actor_state, critic_network=new_critic_state, one_step_network=new_one_step_state, rng=new_rng), info
         
@@ -1821,14 +1715,14 @@ class OGPOAgent(flax.struct.PyTreeNode):
         batch, success_batch = inputs
         sample_rng, sb_rng = jax.random.split(rng, 2)
 
-        # Update 1: regular RB batch
+        # TD update on the replay-buffer batch.
         def critic_loss_fn(p):
             return agent.critic_total_loss(batch, p, sample_rng)
         new_critic_state, critic_info = agent.critic_network.apply_loss_fn(critic_loss_fn)
         agent._critic_target_update(new_critic_state)
         agent = agent.replace(critic_network=new_critic_state)
 
-        # Update 2: success buffer batch (conditional on success being available)
+        # Conditional TD update on the success-buffer batch.
         def do_sb(agent):
             def sb_loss_fn(p):
                 return agent.critic_total_loss(success_batch, p, sb_rng)
@@ -1866,7 +1760,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
         agent.target_update(new_actor_state, 'actor')
         agent.pi_slow_update(new_actor_state)
-        # Update chi_po_drift scalar: chi2_ratio (chi_po) or log_ratio (kl_reg only)
+        # chi_po_drift = mean chi2_ratio (chi_po) or log_ratio (kl_reg only)
         if agent.config.get('chi_po', False):
             agent = agent.replace(chi_po_drift=actor_info['actor/_chi2_ratio'].mean())
         elif agent.config.get('kl_reg', False):
@@ -1874,8 +1768,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if not agent.config.use_constant_noise:
             agent.target_update(new_actor_state, 'noise_net')
 
-        # Update one-step policy with Q-maximization + distillation (if enabled)
-        # During online training, use both Q-loss and distillation since critic is trained
         one_step_info = {}
         new_one_step_state = agent.one_step_network
         if agent.one_step_network is not None and agent.config.get('train_one_step_in_online', True):
@@ -1883,7 +1775,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             def one_step_loss_fn(p):
                 return agent.one_step_distillation_loss(batch, p, rng2, use_q_loss=1.0)
             new_one_step_state, one_step_info = agent.one_step_network.apply_loss_fn(one_step_loss_fn)
-            # Update target network
             agent.target_update(new_one_step_state, 'one_step')
 
         info = {**actor_info, **one_step_info}
@@ -1903,7 +1794,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         """Apply BC loss update to actor network only using success buffer."""
         new_rng, rng1 = jax.random.split(agent.rng, 2)
 
-        # Update actor network with BC loss only
         if agent.config.useSimBa:
             def actor_loss_fn(params, batch_stats):
                 variables = {'params': params, 'batch_stats': batch_stats}
@@ -1924,14 +1814,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 return bc_loss_val, info
             new_actor_state, actor_info = agent.actor_network.apply_loss_fn(actor_loss_fn)
 
-        # Update actor target networks
         agent.target_update(new_actor_state, 'actor')
         agent.pi_slow_update(new_actor_state)
         if not agent.config.use_constant_noise:
             agent.target_update(new_actor_state, 'noise_net')
 
-        # Update one-step policy with Q-maximization + distillation (if enabled)
-        # During online training, use both Q-loss and distillation since critic is trained
         one_step_info = {}
         new_one_step_state = agent.one_step_network
         if agent.one_step_network is not None and agent.config.get('train_one_step_in_online', True):
@@ -1939,7 +1826,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             def one_step_loss_fn(p):
                 return agent.one_step_distillation_loss(batch_success, p, rng2, use_q_loss=1.0)
             new_one_step_state, one_step_info = agent.one_step_network.apply_loss_fn(one_step_loss_fn)
-            # Update target network
             agent.target_update(new_one_step_state, 'one_step')
 
         info = {**actor_info, **one_step_info}
@@ -1952,8 +1838,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return agent, jax.tree_util.tree_map(lambda x: x.mean(), infos)
 
     def target_update(self, network, module_name):
-        """Update the target network."""
-        # Use different tau for actor vs critic
+        """Polyak update of a target network (actor and critic use different tau)."""
         if module_name in ['actor', 'noise_net']:
             tau = self.config['actor_tau']
         else:
@@ -1973,12 +1858,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             self.target_update(network, 'value')
 
     def pi_slow_update(self, network):
-        """Polyak EMA update for pi_slow (the slow reference policy).
-
-        pi_slow is the single shared reference used by chi_po (chi^2 pessimism),
-        kl_reg (reverse KL pessimism), and fwd_kl_reg (forward KL via BC against
-        slow samples). The EMA rate is `tau_slow` (legacy alias: chi_po_ref_tau).
-        """
+        """Polyak EMA update for pi_slow, the slow reference policy shared by chi_po, kl_reg, and fwd_kl_reg."""
         if self.pi_slow_params is None:
             return
         tau = self.config.get('tau_slow', self.config.get('chi_po_ref_tau', 0.0005))
@@ -1998,10 +1878,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions_BON(self, observations: jnp.ndarray, rng: jnp.ndarray = None, images: jnp.ndarray = None, full_state: jnp.ndarray = None) -> jnp.ndarray:
-        """Fully vectorized Best-of-N action selection.
-        Best action -> max ( min ( Q(s, a)))
-        """
-        # Approach B: observations are always flat state, images are separate
+        """Vectorized Best-of-N action selection: best action -> argmax_a min_ensemble Q(s, a)."""
         is_single_obs = observations.ndim == 1
         if is_single_obs:
             observations = observations[None]
@@ -2013,7 +1890,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         batch_size = observations.shape[0]
         num_samples = self.config.best_of_n
 
-        # 1. Generate all B*N candidate actions in one forward pass
         rng, action_key = jax.random.split(rng)
         obs_expanded = jnp.repeat(observations, num_samples, axis=0)  # [B*N, obs_dim]
         images_expanded = jnp.repeat(images, num_samples, axis=0) if images is not None else None
@@ -2021,8 +1897,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
             obs_expanded, rng=action_key, use_target=True, is_encoded=False, images=images_expanded
         )
 
-        # 2. Evaluate Q-ensemble for all candidates
-        # Critic uses full_state when originally state-based (for state-based critic in image env)
+        # Critic uses full_state when originally state-based (state-based critic in image env).
         original_critic_obs = self.config.get('_original_critic_obs', self.config.get('critic_obs', 'state'))
         if full_state is not None and original_critic_obs == 'state':
             c_obs_expanded = jnp.repeat(full_state, num_samples, axis=0)
@@ -2034,7 +1909,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         is_enc = self._critic_is_encoded()
 
         if self.config.get('use_mip_q', False):
-            # MIP-Q path: two-step sampling for all candidates
             num_ensemble_members = self.config.get('num_ensemble_members', 10)
             noise_scale = self.config.get('mip_q_noise_scale', 1.0)
             mip_t_star = self.config.get('mip_q_t_star', 0.9)
@@ -2072,14 +1946,12 @@ class OGPOAgent(flax.struct.PyTreeNode):
             q_values = q_values_flat.reshape(num_ensemble_members, batch_size, num_samples)
             num_ensemble_or_noise = num_ensemble_members
         else:
-            # Original ensemble-Q path
             q_ensemble = self.critic_network.select('target_critic')(
                 critic_obs, actions=sampled_actions, is_encoded=is_enc
             )
             q_values = q_ensemble.reshape(self.config.num_qs, batch_size, num_samples)
             num_ensemble_or_noise = self.config.num_qs
 
-        # 3. Aggregate Q-ensemble per candidate (Python if — static at trace time)
         if self.config.subsample_bon:
             rng, sub_key = jax.random.split(rng)
             idxs = jax.random.randint(sub_key, (2, batch_size, num_samples), 0, num_ensemble_or_noise)
@@ -2088,7 +1960,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         else:
             min_qs = jnp.min(q_values, axis=0)                     # (B, N)
 
-        # 4. Select the best candidate per observation
         best_idx = jnp.argmax(min_qs, axis=1)                      # (B,)
         actions_reshaped = sampled_actions.reshape(batch_size, num_samples, -1)
         best_actions = jax.vmap(lambda a, i: a[i])(actions_reshaped, best_idx)  # (B, act_dim)
@@ -2114,12 +1985,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
     @partial(jax.jit, static_argnames=('is_encoded',))
     def sample_actions_one_step(self, observations: jnp.ndarray, rng: jnp.ndarray = None, is_encoded: bool = False, images: jnp.ndarray = None) -> jnp.ndarray:
-        """Sample actions using the one-step policy (direct mapping from noise to actions).
-
-        This is used for eval_one_step mode and provides ~10x faster inference than ODE sampling.
-        """
+        """Sample actions using the one-step policy (direct noise-to-action map; faster than ODE sampling)."""
         if self.one_step_network is None:
-            # Fallback to standard flow policy if one-step is not available
             return self.sample_actions(observations, rng, is_encoded, images)
 
         add_batch_dim = False
@@ -2130,19 +1997,15 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 if images is not None:
                     images = images[None]
 
-        # Encode observations
         obs_encoded = self._encode_for_actor(observations, images=images, use_target=True) if not is_encoded else observations
 
-        # Sample noise
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
         noise = jax.random.normal(rng, (obs_encoded.shape[0], act_dim))
 
-        # One-step forward pass
         actions = self.one_step_network.select('target_one_step')(
             obs_encoded, noise, is_encoded=True
         )
 
-        # Clip actions
         actions = jnp.clip(actions, self.config.act_min, self.config.act_max)
 
         if add_batch_dim:
@@ -2151,20 +2014,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions_one_step_BON(self, observations: jnp.ndarray, rng: jnp.ndarray = None, images: jnp.ndarray = None) -> jnp.ndarray:
-        """Best-of-N action selection using the one-step policy.
-
-        Samples N candidate actions using the one-step policy with different noise samples,
-        evaluates them with the Q-ensemble, and selects the action with highest Q-value.
-
-        Best action -> max ( min ( Q(s, a)))
-
-        Note: Like sample_actions_BON, this method expects raw (non-encoded) observations.
-        """
+        """Best-of-N action selection with the one-step policy (expects raw observations)."""
         if self.one_step_network is None:
-            # Fallback to standard BON if one-step is not available
             return self.sample_actions_BON(observations, rng, images)
 
-        # Handle single observation case
         is_single_obs = observations.ndim == 1
         if is_single_obs:
             observations = observations[None]
@@ -2175,35 +2028,26 @@ class OGPOAgent(flax.struct.PyTreeNode):
         num_samples = self.config.best_of_n
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
 
-        # Expand observations and images to B*N
         obs_expanded = jnp.repeat(observations, num_samples, axis=0)  # [B*N, obs_dim]
         images_expanded = jnp.repeat(images, num_samples, axis=0) if images is not None else None
 
-        # Encode expanded observations for actor
         obs_encoded_actor = self._encode_for_actor(obs_expanded, images=images_expanded, use_target=True)
 
-        # 1. Generate N candidate actions using one-step policy with different noise samples
         rng, noise_rng = jax.random.split(rng)
-        # Generate B*N noise samples
         noise_samples = jax.random.normal(noise_rng, (batch_size * num_samples, act_dim))
 
-        # Generate all candidate actions in one forward pass
         sampled_actions = self.one_step_network.select('target_one_step')(
             obs_encoded_actor, noise_samples, is_encoded=True
         )
         sampled_actions = jnp.clip(sampled_actions, self.config.act_min, self.config.act_max)
 
-        # 2. Evaluate Q-ensemble for all candidates
-        # Encode expanded observations for critic
         critic_obs = self._encode_for_critic(obs_expanded, images=images_expanded, use_target=True)
 
         q_ensemble = self.critic_network.select('target_critic')(
             critic_obs, actions=sampled_actions, is_encoded=bool(self.config.encoder)
         )
-        # Reshape to (num_qs, B, N)
-        q_values = q_ensemble.reshape(self.config.num_qs, batch_size, num_samples)
+        q_values = q_ensemble.reshape(self.config.num_qs, batch_size, num_samples)  # (num_qs, B, N)
 
-        # 3. Aggregate Q-ensemble per candidate (min across ensemble)
         if self.config.subsample_bon:
             rng, sub_key = jax.random.split(rng)
             idxs = jax.random.randint(sub_key, (2, batch_size, num_samples), 0, self.config.num_qs)
@@ -2212,7 +2056,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         else:
             min_qs = jnp.min(q_values, axis=0)                     # (B, N)
 
-        # 4. Select the best candidate per observation
         best_idx = jnp.argmax(min_qs, axis=1)                      # (B,)
         actions_reshaped = sampled_actions.reshape(batch_size, num_samples, -1)
         best_actions = jax.vmap(lambda a, i: a[i])(actions_reshaped, best_idx)  # (B, act_dim)
@@ -2223,14 +2066,9 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return best_actions
 
     def _check_add_batch_dim(self, observations, is_encoded):
-        """Check if batch dimension needs to be added (based on static ndim).
-
-        This is NOT jitted - it just checks static shape properties.
-        Returns a Python bool that can be used in Python conditionals.
-        """
+        """Whether a batch dim must be added (Python bool from static ndim; not jitted)."""
         if is_encoded:
             return False
-        # Approach B: observations are always flat state vectors
         return observations.ndim == 1
 
     def _encode_observations_for_flow(self, observations, is_encoded, images=None):
@@ -2242,7 +2080,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
     @partial(jax.jit, static_argnames=('is_encoded', 'noises', '_add_batch_dim'))
     def _compute_flow_actions_impl(self, observations, rng=None, noises=None, is_encoded=False, _add_batch_dim=False, images=None):
         """Internal jitted implementation. Use compute_flow_actions() instead."""
-        # Add batch dim if needed (static argument)
         if _add_batch_dim:
             observations = observations[None, ...]
             if images is not None:
@@ -2252,11 +2089,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
         observations = self._encode_observations_for_flow(observations, is_encoded, images=images)
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
 
-        # Create wrapper function for actor network
         def actor_fn(obs, actions, t, is_encoded=True, return_denoiser=False):
             return self.actor_network.select('actor')(obs, actions, t, is_encoded=is_encoded, return_denoiser=return_denoiser)
 
-        # FPO++ zero-sampling: use zeros instead of random noise for ODE init
+        # FPO++ zero-sampling: use zeros instead of random noise for ODE init.
         if self.config.get('fpo_zero_sampling', False) and noises is None:
             ode_noises = jnp.zeros((batch_size, act_dim))
         else:
@@ -2265,7 +2101,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if self.config.policy_type == 'diffusion':
             raise NotImplementedError("Diffusion policy not available on this branch")
         elif self.config.policy_type == 'mip':
-            # Use pg_helper for MIP ODE sampling
             actions = sample_mip_actions_ode(
                 actor_fn=actor_fn,
                 observations=observations,
@@ -2278,7 +2113,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 is_encoded=True,
             )
         elif self.config["use_shortcut"]:
-            # Shortcut logic (OGPO-specific, kept inline)
             if ode_noises is None:
                 actions = jax.random.normal(rng, (batch_size, act_dim))
             else:
@@ -2292,7 +2126,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 actions = actions + vels * step_size
             actions = jnp.clip(actions, self.config.act_min, self.config.act_max)
         else:
-            # Use pg_helper for standard ODE flow (no correction)
             actions = sample_flow_actions_ode(
                 actor_fn=actor_fn,
                 observations=observations,
@@ -2301,7 +2134,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 act_dim=act_dim,
                 act_min=self.config.act_min,
                 act_max=self.config.act_max,
-                clip_intermediate=False,  # Match old code: no intermediate clipping in ODE inference
+                clip_intermediate=False,  # no intermediate clipping in ODE inference
                 clip_value=self.config['denoised_clip_value'],
                 noises=ode_noises,
                 is_encoded=True,
@@ -2312,21 +2145,13 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return actions
 
     def compute_flow_actions(self, observations, rng=None, noises=None, is_encoded=False, images=None, full_state=None):
-        """Compute actions using pure ODE flow (no SDE-to-ODE correction).
-
-        This is the standard evaluation method for BC phase.
-        Uses pg_helper functions for ODE flow and MIP modes.
-
-        For online RL evaluation (after SDE training), use compute_flow_actions_corrected instead.
-        """
-        # Compute add_batch_dim based on static ndim (before tracing)
+        """Compute actions via pure ODE flow (no SDE-to-ODE correction); standard BC-phase eval."""
         add_batch_dim = self._check_add_batch_dim(observations, is_encoded)
         return self._compute_flow_actions_impl(observations, rng, noises, is_encoded, _add_batch_dim=add_batch_dim, images=images)
 
     @partial(jax.jit, static_argnames=('is_encoded', 'noises', '_add_batch_dim'))
     def _compute_flow_actions_corrected_impl(self, observations, rng=None, noises=None, is_encoded=False, _add_batch_dim=False, images=None):
         """Internal jitted implementation. Use compute_flow_actions_corrected() instead."""
-        # Add batch dim if needed (static argument)
         if _add_batch_dim:
             observations = observations[None, ...]
             if images is not None:
@@ -2336,11 +2161,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
         observations = self._encode_observations_for_flow(observations, is_encoded, images=images)
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
 
-        # Create wrapper function for actor network (with denoiser support)
         def actor_fn(obs, actions, t, is_encoded=True, return_denoiser=False):
             return self.actor_network.select('actor')(obs, actions, t, is_encoded=is_encoded, return_denoiser=return_denoiser)
 
-        # FPO++ zero-sampling: use zeros instead of random noise for ODE init
+        # FPO++ zero-sampling: use zeros instead of random noise for ODE init.
         if self.config.get('fpo_zero_sampling', False) and noises is None:
             ode_noises = jnp.zeros((batch_size, act_dim))
         else:
@@ -2349,7 +2173,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if self.config.policy_type == 'diffusion':
             raise NotImplementedError("Diffusion policy not available on this branch")
         elif self.config.policy_type == 'mip':
-            # MIP doesn't use correction (different formulation)
+            # MIP does not use correction.
             actions = sample_mip_actions_ode(
                 actor_fn=actor_fn,
                 observations=observations,
@@ -2362,7 +2186,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 is_encoded=True,
             )
         elif self.config["use_shortcut"]:
-            # Shortcut doesn't use correction
+            # Shortcut does not use correction.
             if ode_noises is None:
                 actions = jax.random.normal(rng, (batch_size, act_dim))
             else:
@@ -2376,11 +2200,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 actions = actions + vels * step_size
             actions = jnp.clip(actions, self.config.act_min, self.config.act_max)
         else:
-            # Legacy denoiser-trained ODE-with-correction is gated on
-            # error_correct_ode_to_sde + use_denoiser. When either is off,
-            # fall back to plain Euler ODE — that matches compute_flow_actions
-            # and is the right behavior for the new score-correction default
-            # (correction is applied in SDE sampling, not ODE eval).
+            # Legacy denoiser-trained ODE-with-correction requires both flags;
+            # otherwise fall back to plain Euler ODE (correction belongs in SDE sampling, not ODE eval).
             use_legacy_correction = (
                 self.config.get('error_correct_ode_to_sde', False)
                 and self.config.get('use_denoiser', False)
@@ -2420,17 +2241,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
         return actions
 
     def compute_flow_actions_corrected(self, observations, rng=None, noises=None, is_encoded=False, images=None, full_state=None):
-        """Compute actions using ODE flow.
-
-        With the legacy `error_correct_ode_to_sde`+`use_denoiser` combo, falls
-        through to the denoiser-trained correction sampler. Otherwise (the new
-        default), this is plain Euler ODE — score correction belongs in SDE
-        sampling, not deterministic ODE evaluation.
-        """
+        """Compute actions via ODE flow, using the denoiser-trained correction sampler under the legacy flags."""
         add_batch_dim = self._check_add_batch_dim(observations, is_encoded)
         return self._compute_flow_actions_corrected_impl(observations, rng, noises, is_encoded, _add_batch_dim=add_batch_dim, images=images)
 
-    # @jax.jit
     def sample_actions_with_noise(
             self,
             observations: jnp.ndarray,
@@ -2445,13 +2259,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
         actor_module_name = 'target_actor'
         noise_module_name = 'target_noise_net'
 
-        # Encode observations
         if not is_encoded:
             observations = self._encode_for_actor(observations, images=images, use_target=use_target)
 
         act_dim = self.config.action_dim * (self.config.horizon_length if self.config.action_chunking else 1)
 
-        # Create wrapper functions for the network calls
         def actor_fn(obs, actions, t, params=None, is_encoded=True):
             return self.actor_network.select(actor_module_name)(obs, actions, t, params=params, is_encoded=is_encoded)
 
@@ -2503,8 +2315,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 ft_flow_steps=ft_flow_steps,
             )
 
-        # Apply normalization options (matching compute_log_probs_and_entropy)
-        # When ft_flow_steps is active, normalization uses the effective step count
+        # Normalization (matches compute_log_probs_and_entropy); ft_flow_steps uses the effective step count.
         if self.config.policy_type == 'diffusion':
             raise NotImplementedError("Diffusion policy not available on this branch")
         elif self.config.policy_type == 'mip':
@@ -2530,20 +2341,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
         obs_encoded: jnp.ndarray = None,
         images: jnp.ndarray = None,
     ) -> Tuple[jnp.ndarray, dict]:
-        """
-        Compute flow matching BC loss.
-
-        Supports three modes:
-        1. MIP mode: Two-term loss (regression at t=0 + denoising at t=t*)
-        2. Flow + Denoiser mode: Velocity + noise prediction (OGPO-specific SDE-ODE correction)
-        3. Standard flow matching: Velocity prediction only
-
-        Uses bc_helper functions for common operations.
-        """
+        """Flow-matching BC loss (MIP two-term, flow+denoiser, or standard velocity prediction)."""
         batch_actions = preprocess_actions(batch, self.config["action_chunking"])
         batch_size = batch_actions.shape[0]
 
-        # Encoder handling
         if images is None:
             images = batch.get('images')
         if obs_encoded is None:
@@ -2555,18 +2356,16 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if self.config.policy_type == 'diffusion':
             raise NotImplementedError("Diffusion policy not available on this branch")
         elif self.config.policy_type == 'mip':
-            # ========== MIP Mode: Two-term loss (uses bc_helper) ==========
+            # MIP two-term loss: regression at t=0 + denoising at t=t*.
             x_0, x_t_star, t_0_arr, t_star_arr = get_mip_targets(
                 batch_actions, rng, self.config.mip_t_star
             )
 
-            # Term 1: Regression at t=0
             pred_0 = self.actor_network.select('actor')(
                 actor_obs, x_0, t_0_arr, params=grad_params, is_encoded=self._actor_is_encoded()
             )
             loss_regression_raw = jnp.square(pred_0 - batch_actions)
 
-            # Term 2: Denoising at t=t*
             pred_t_star = self.actor_network.select('actor')(
                 actor_obs, x_t_star, t_star_arr, params=grad_params, is_encoded=self._actor_is_encoded()
             )
@@ -2596,11 +2395,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 'bc_mip_loss_denoising': loss_denoising,
             }
         else:
-            # ========== Standard Flow Matching Mode ==========
             rng, targets_rng = jax.random.split(rng)
 
             if self.config.use_shortcut:
-                # OGPO-specific: Shortcut targets with bootstrapping
+                # Shortcut targets with bootstrapping.
                 def model_call_fn(obs, x_t, t, dt_base):
                     return self.actor_network.select('target_actor')(obs, x_t, t, dt_base)
 
@@ -2621,7 +2419,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 loss_denoising = 0.0
 
                 if self.config.use_denoiser:
-                    # OGPO-specific: Denoiser for SDE-to-ODE correction
+                    # Denoiser branch for SDE-to-ODE correction.
                     rng, z_rng = jax.random.split(rng)
                     z = jax.random.normal(z_rng, x_t.shape)
 
@@ -2647,7 +2445,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                         is_encoded=self._actor_is_encoded()
                     )
 
-            # Velocity loss
             loss_vel = apply_chunking_mask(
                 jnp.square(pred - vel), valid_mask, batch_size,
                 self.config["horizon_length"], self.config["action_dim"],
@@ -2668,69 +2465,45 @@ class OGPOAgent(flax.struct.PyTreeNode):
         batch: dict,
         grad_params: flax.core.FrozenDict,
         rng: jnp.ndarray,
-        use_q_loss = 1.0,  # Float: 1.0 for online RL, 0.0 for BC training
+        use_q_loss = 1.0,  # 1.0 for online RL, 0.0 for BC training (critic untrained)
     ) -> Tuple[jnp.ndarray, dict]:
-        """FQL one-step policy loss: Q-maximization + distillation from flow policy.
-
-        L_policy(ω) = -Q(s, μω(s, z)) + α * ||μω(s, z) - ODE_solve(μθ(s, ·, ·), z)||²
-
-        The one-step policy learns to:
-        1. Maximize Q-values (RL objective) - only when use_q_loss=True
-        2. Stay close to the flow policy output (BC regularization via distillation)
-
-        The balance is controlled by fql_distillation_coeff (α).
-
-        Args:
-            use_q_loss: Float coefficient (1.0 for online RL, 0.0 for BC training when critic is untrained)
-        """
+        """FQL one-step policy loss: Q-maximization + distillation from the flow policy (balance set by fql_distillation_coeff)."""
         if self.one_step_network is None:
             raise ValueError("one_step_network is None. Set use_one_step_policy=true in config.")
 
         batch_size = batch['observations'].shape[0]
         rng, noise_rng, ode_rng, q_rng = jax.random.split(rng, 4)
 
-        # Preprocess actions and encode observations
         batch_actions = preprocess_actions(batch, self.config.action_chunking)
         act_dim = batch_actions.shape[-1]
 
-        # Encode observations for actor
         images = batch.get('images')
         obs_encoded_actor = self._encode_for_actor(batch['observations'], images=images, params=grad_params)
 
-        # Sample noise
         noise = jax.random.normal(noise_rng, (batch_size, act_dim))
 
-        # One-step policy prediction
         actions_one_step = self.one_step_network.select('one_step')(
             obs_encoded_actor, noise, is_encoded=True, params=grad_params
         )
 
-        # === Q-Maximization Loss ===
-        # Encode observations for critic using target encoder (for stability)
+        # Q-maximization (target encoder/critic for stability; zeroed via use_q_loss during BC).
         obs_encoded_critic = self._encode_for_critic(batch['observations'], images=images, use_target=True)
         is_enc = bool(self.config.encoder)
 
-        # Compute Q-values for one-step policy actions using target critic (standard practice)
-        # Note: We always compute Q-values to keep computation graph consistent, but we can zero out
-        # the loss coefficient during BC training when critic is untrained
         q_values = self.critic_network.select('target_critic')(
             obs_encoded_critic, actions=actions_one_step, is_encoded=is_enc
-        )  # Shape: (num_qs, batch_size)
+        )  # (num_qs, batch_size)
 
-        # Aggregate Q-values across ensemble
         q_aggregated = aggregate_q_values(
             q_values,
             method=self.config.get('q_agg', 'mean'),
             rng=q_rng,
             num_qs=self.config.get('num_qs', 10),
-        )  # Shape: (batch_size,)
+        )  # (batch_size,)
 
-        # Q-maximization: minimize negative Q (i.e., maximize Q)
-        # Multiply by coefficient: 1.0 during online RL, 0.0 during BC training
         q_loss = -jnp.mean(q_aggregated) * use_q_loss
 
-        # === Distillation Loss ===
-        # Get distillation target from flow policy ODE (NO GRADIENTS)
+        # Distillation target from the flow-policy ODE (no gradients).
         def actor_fn(obs, actions, t, is_encoded=True):
             return self.actor_network.select('target_actor')(obs, actions, t, is_encoded=is_encoded)
 
@@ -2744,20 +2517,16 @@ class OGPOAgent(flax.struct.PyTreeNode):
             act_max=self.config.act_max,
             clip_intermediate=self.config.get('clip_intermediate_actions', True),
             clip_value=self.config.get('denoised_clip_value', 1.0),
-            noises=noise,  # Use same noise for fair comparison
+            noises=noise,  # same noise for fair comparison
             is_encoded=True,
         )
 
-        # Stop gradients on the flow ODE target
         actions_flow_ode = jax.lax.stop_gradient(actions_flow_ode)
 
-        # L2 distillation loss
         distill_loss = jnp.mean(jnp.square(actions_one_step - actions_flow_ode))
 
-        # === Gradient Norm Computation (for logging/tuning alpha) ===
-        # Compute gradient norms for each component to help tune fql_distillation_coeff
+        # Per-component gradient norms (logging only) to help tune fql_distillation_coeff.
         def compute_q_loss_only(params):
-            """Helper to compute Q-loss for gradient norm calculation."""
             actions = self.one_step_network.select('one_step')(
                 obs_encoded_actor, noise, is_encoded=True, params=params
             )
@@ -2773,24 +2542,19 @@ class OGPOAgent(flax.struct.PyTreeNode):
             return -jnp.mean(q_agg) * use_q_loss
 
         def compute_distill_loss_only(params):
-            """Helper to compute distillation loss for gradient norm calculation."""
             actions = self.one_step_network.select('one_step')(
                 obs_encoded_actor, noise, is_encoded=True, params=params
             )
             return jnp.mean(jnp.square(actions - actions_flow_ode))
 
-        # Compute gradient norms (only for logging, not for training)
         grad_q = jax.grad(compute_q_loss_only)(grad_params)
         grad_distill = jax.grad(compute_distill_loss_only)(grad_params)
 
-        # Compute L2 norms of gradients
         grad_q_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grad_q)))
         grad_distill_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grad_distill)))
 
-        # Compute weighted gradient norm (what's actually applied)
         grad_distill_weighted_norm = grad_distill_norm * self.config.get('fql_distillation_coeff', 10.0)
 
-        # === Total Loss ===
         fql_distillation_coeff = self.config.get('fql_distillation_coeff', 10.0)
         total_loss = q_loss + fql_distillation_coeff * distill_loss
 
@@ -2805,11 +2569,10 @@ class OGPOAgent(flax.struct.PyTreeNode):
             'flow_ode_actions_mean': actions_flow_ode.mean(),
             'flow_ode_actions_std': actions_flow_ode.std(),
             'fql_distillation_coeff': fql_distillation_coeff,
-            # Gradient norms for tuning alpha
             'one_step_grad_q_norm': grad_q_norm,
             'one_step_grad_distill_norm': grad_distill_norm,
             'one_step_grad_distill_weighted_norm': grad_distill_weighted_norm,
-            'one_step_grad_ratio': grad_q_norm / (grad_distill_norm + 1e-8),  # Ratio for balancing
+            'one_step_grad_ratio': grad_q_norm / (grad_distill_norm + 1e-8),
         }
 
         return total_loss, info
@@ -2832,13 +2595,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
         actor_state = actor_state or self.actor_network
         critic_state = critic_state or self.critic_network
 
-        # Parameter norms
         actor_norm = compute_param_norm(actor_state.params['modules_actor'])
         target_actor_norm = compute_param_norm(actor_state.params['modules_target_actor'])
         critic_norm = compute_param_norm(critic_state.params['modules_critic'])
         target_critic_norm = compute_param_norm(critic_state.params['modules_target_critic'])
 
-        # Parameter difference norms
         actor_diff_norm = compute_param_diff_norm(
             actor_state.params['modules_actor'],
             actor_state.params['modules_target_actor']
@@ -2848,7 +2609,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             critic_state.params['modules_target_critic']
         )
 
-        # OGPO-specific: noise network norms
         noise_info = {}
         if not self.config.use_constant_noise:
             noise_norm = compute_param_norm(actor_state.params['modules_noise_net'])
@@ -2879,7 +2639,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
 
     def reset_optimizers_with_lr(self,) -> 'OGPOAgent':
         """Reset optimizers with new LR for online RL phase."""
-        # Unfreeze encoder for online RL (was frozen during BC)
         if self.config.get('_freeze_encoder_for_bc', False):
             self.config['_freeze_encoder_for_bc'] = False
             print("[reset_optimizers] Unfreezing encoder for online RL")
@@ -2898,7 +2657,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             end_value=self.config.critic_end_value
         )
 
-        # Check if we need encoder-aware optimizer
         _has_trainable_encoder = (
             self.config.get('actor_obs') == 'image'
             and not self.config.get('_encoder_frozen', False)
@@ -2938,9 +2696,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
         new_critic_opt_state = new_critic_tx.init(self.critic_network.params)
         new_critic_network = self.critic_network.replace(tx=new_critic_tx, opt_state=new_critic_opt_state, step=1)
 
-        # pi_slow: snapshot current actor params as slow reference (starts at BC policy).
-        # Shared by chi_po (chi^2), kl_reg (reverse KL), fwd_kl_reg (forward KL via BC).
-        # Drift init: 1.0 if chi_po (chi2_ratio), 0.0 if kl-only (log_ratio); irrelevant for fwd_kl_reg-only.
+        # pi_slow: snapshot current actor as slow reference (shared by chi_po, kl_reg, fwd_kl_reg).
+        # Drift init: 1.0 for chi_po (chi2_ratio), else 0.0 (log_ratio).
         ref_params = None
         chi_po_drift = None
         chi_po_on = self.config.get('chi_po', False)
@@ -2967,12 +2724,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         _restore_actor_params(self.actor_network, actor_path, has_encoder=self._actor_is_encoded())
 
     def create_frozen_encode_fn(self):
-        """Create a standalone JIT-compiled encode function using the trained actor encoder.
-
-        Extracts encoder params from the actor network at the end of BC,
-        creating a function with fixed (frozen) weights. The params are captured
-        as concrete arrays, avoiding stale closure issues with PyTreeNodes.
-        """
+        """Create a JIT-compiled encode function with the trained actor encoder's frozen weights."""
         from ogpo.networks.encoders import VisionProprioEncoder
         from ogpo.networks.encoders import vit_encoder_modules as _vit_modules
 
@@ -2997,11 +2749,9 @@ class OGPOAgent(flax.struct.PyTreeNode):
         """Initialize a OGPOAgent with network states."""
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng)
-        # derive dims
         ex_times = ex_actions[..., :1]
         ob_dims = ex_observations.shape
         action_dim = ex_actions.shape[-1]
-        # full action dim for chunking
         if config.action_chunking:
             full_actions = jnp.concatenate([ex_actions] * config.horizon_length, axis=-1)
         else:
@@ -3010,7 +2760,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         config['full_act_dim'] = full_act_dim
         config.adv_clip_min = adv_clip_min
         config['proprio_dim'] = ex_observations.shape[-1]
-        # Policy type validation and setup
         if config['policy_type'] == 'diffusion':
             raise NotImplementedError("Diffusion policy not available on this branch")
         elif config['policy_type'] == 'mip':
@@ -3019,7 +2768,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         else:
             print(f"[Flow Mode] Using Flow Matching with {config.flow_steps} steps")
 
-        # Noise / SDE-correction flag validation
         use_constant_noise = bool(config.get('use_constant_noise', False))
         use_tapered_noise = bool(config.get('use_tapered_noise', False))
         error_correct_sde_to_ode = bool(config.get('error_correct_sde_to_ode', False))
@@ -3036,14 +2784,12 @@ class OGPOAgent(flax.struct.PyTreeNode):
             print("[WARN] error_correct_sde_to_ode=True with policy_type=mip is a no-op "
                   "(MIP actor outputs a denoiser, not a velocity).")
 
-        # encoders
         encoders = dict()
-        # Vision path: VisionProprioEncoder for actor_obs/critic_obs == 'image'
+        # Vision path: VisionProprioEncoder when actor_obs/critic_obs == 'image'.
         if config.actor_obs == 'image' or config.critic_obs == 'image':
             from ogpo.networks.encoders import VisionProprioEncoder
             assert ex_images is not None, "ex_images required when actor_obs or critic_obs is 'image'"
-            # Infer image dims from example data: ex_images shape is (H, W, C)
-            vit_img_h, vit_img_w, vit_num_ch = ex_images.shape
+            vit_img_h, vit_img_w, vit_num_ch = ex_images.shape  # (H, W, C)
             print(f"[Vision] ViT input: {vit_img_h}x{vit_img_w}, {vit_num_ch} channels")
         if config.actor_obs == 'image':
             actor_vit = vit_encoder_modules[config.vit_encoder](
@@ -3065,7 +2811,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 freeze_backbone=config.get('freeze_vit_backbone', False),
             )
             config['encoder'] = 'vision'
-        # Legacy encoder path (existing CNN/ViT encoders without Approach B)
+        # Legacy CNN/ViT encoder path.
         if config.encoder and config.actor_obs == 'state' and config.critic_obs == 'state':
             if 'vit' in config.encoder:
                 encoder_module = vit_encoder_modules[config.encoder]
@@ -3073,7 +2819,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 encoder_module = encoder_modules[config.encoder]
             encoders['critic'] = encoder_module()
             encoders['actor'] = encoder_module()
-        # Resolve backbone per-network (useTF is a convenience shortcut)
+        # Resolve per-network backbone (useTF forces 'tf' for both).
         a_backbone = config['actor_backbone']
         c_backbone = config['critic_backbone']
         if config.useTF:
@@ -3082,7 +2828,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
         config['actor_backbone'] = a_backbone
         config['critic_backbone'] = c_backbone
 
-        # --- Time embedding (sinusoidal or None for raw scalar) ---
         time_emb_type = config.get('time_embedding', 'scalar')
         time_emb_module = None
         if time_emb_type == 'sinusoidal':
@@ -3091,7 +2836,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             )
             print(f"[time_embedding] sinusoidal (dim={config.get('time_embedding_dim', 32)})")
 
-        # --- Actor definition ---
         if config['policy_type'] == 'diffusion':
             raise NotImplementedError("Diffusion policy not available on this branch")
         elif a_backbone == 'tf':
@@ -3132,7 +2876,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 two_tier_fused_dim=config.get('two_tier_fused_dim', 0),
             )
 
-        # --- Critic definition ---
         if c_backbone == 'tf':
             critic_def = ValueTF(
                 hidden_dim=config.tf_q_embed_dim,
@@ -3163,9 +2906,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 rs_norm_epsilon=1e-8,
             )
         elif config.get('use_mip_q', False):
-            # MIP-Q: Choose between explicit ensemble or implicit ensemble
             if config.get('mip_q_ensemble', False):
-                # Explicit ensemble: Multiple networks with single shared noise
+                # Explicit ensemble: multiple networks with a single shared noise.
                 from ogpo.networks import ValueMIPEnsemble
                 critic_def = ValueMIPEnsemble(
                     hidden_dims=config['value_hidden_dims'],
@@ -3182,7 +2924,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 print(f"[MIP-Q Ensemble Mode] Using EXPLICIT ensemble with {config.get('num_ensemble_members', 10)} networks, "
                       f"noise_scale={config.get('mip_q_noise_scale', 1.0)}, t*={config.get('mip_q_t_star', 0.9)}")
             else:
-                # Implicit ensemble: Single network with multiple noise samples
+                # Implicit ensemble: single network with multiple noise samples.
                 from ogpo.networks import ValueMIP
                 critic_def = ValueMIP(
                     hidden_dims=config['value_hidden_dims'],
@@ -3214,8 +2956,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 two_tier_proprio_dim=config.get('_two_tier_proprio_dim', 0),
                 two_tier_fused_dim=config.get('two_tier_fused_dim', 0),
             )
-            
-        # Add batch dimension if missing
+
         ex_observations = ex_observations[None, ...]
         full_actions = full_actions[None, ...]
         ex_times = ex_times[None, ...]
@@ -3225,13 +2966,12 @@ class OGPOAgent(flax.struct.PyTreeNode):
             ex_full_states = ex_full_states[None, ...]
 
         print(ex_observations.shape, full_actions.shape, ex_times.shape)
-        # Use _original_critic_obs to determine critic init (survives frozen encoder override)
+        # _original_critic_obs survives the frozen-encoder override.
         original_critic_obs = config.get('_original_critic_obs', config.get('critic_obs', 'state'))
         if ex_full_states is not None and original_critic_obs == 'state':
             print(f"[Mixed obs] actor_obs={config.actor_obs} ({ex_observations.shape[-1]}D), "
                   f"critic_obs={original_critic_obs} ({ex_full_states.shape[-1]}D full state)")
 
-        # --- Build init args using dicts (ModuleDict Mapping dispatch) ---
         actor_nets = {'actor': actor_def, 'target_actor': copy.deepcopy(actor_def)}
 
         actor_init_kw = dict(
@@ -3254,14 +2994,14 @@ class OGPOAgent(flax.struct.PyTreeNode):
         }
 
         critic_nets = {'critic': critic_def, 'target_critic': copy.deepcopy(critic_def)}
-        # When critic was originally state-based, use full_states (23D) instead of proprio (9D)
+        # State-based critic uses full_states instead of proprio.
         ex_critic_obs = ex_full_states if (ex_full_states is not None and original_critic_obs == 'state') else ex_observations
         critic_init_kw = dict(observations=ex_critic_obs, actions=full_actions)
         if original_critic_obs == 'image' and ex_images is not None:
             critic_init_kw['images'] = ex_images
         critic_args = {'critic': critic_init_kw, 'target_critic': critic_init_kw}
 
-        # State-only V(s) ensemble (reuses Value class with actions=None at call time)
+        # State-only V(s) ensemble (reuses Value with actions=None at call time).
         if config.get('use_value_fn', False):
             v_ens_size = config.get('v_ensemble_size', 10)
             if config.get('v_pair_with_q', False) and v_ens_size != config['num_qs']:
@@ -3316,16 +3056,11 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 ex_noise_obs = ex_observations
             actor_args['noise_net'] = (ex_noise_obs, ex_times)
             actor_args['target_noise_net'] = (ex_noise_obs, ex_times)
-            
-        # Create separate network definitions
+
         actor_net_def = ModuleDict(actor_nets)
         critic_net_def = ModuleDict(critic_nets)
-        
-        # Define optimizer with hyperparameter injection
-        
-        # Create learning rate schedules
-        # For BC training, use constant scheduler if flag is set
-        # Ensure all numeric values are Python scalars (not arrays)
+
+        # Coerce numeric config values to Python scalars (not arrays).
         actor_lr = float(config['actor_lr'])
         critic_lr = float(config['critic_lr'])
         clip_grad_norm = float(config.clip_grad_norm)
@@ -3333,7 +3068,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         critic_weight_decay = float(config.critic_weight_decay)
 
         if config.use_constant_scheduler_for_bc:
-            actor_lr_schedule = actor_lr  # constant for BC
+            actor_lr_schedule = actor_lr
         else:
             actor_lr_schedule = create_lr_schedule(
                 scheduler_type=config.actor_scheduler,
@@ -3350,7 +3085,6 @@ class OGPOAgent(flax.struct.PyTreeNode):
             end_value=float(config.critic_end_value)
         )
 
-        # Create separate optimizers with injected hyperparameters
         if config.use_muon:
             actor_tx = optax.chain(
                 optax.clip_by_global_norm(clip_grad_norm),
@@ -3385,17 +3119,15 @@ class OGPOAgent(flax.struct.PyTreeNode):
                 adam_optimizer(learning_rate=critic_lr_schedule, weight_decay=critic_weight_decay)
             )
 
-        # Override actor optimizer with encoder-aware version if vision encoder is active
         _has_trainable_encoder = (
             config.get('actor_obs') == 'image'
             and not config.get('_encoder_frozen', False)
             and config.get('encoder_lr', 0) > 0
         )
 
-        # Initialize parameters
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
 
-        # MIP-Q needs rng for initialization (split for critic and target_critic)
+        # MIP-Q needs rng for initialization.
         if config.get('use_mip_q', False):
             critic_init_rng, target_critic_init_rng = jax.random.split(critic_rng)
             critic_args['critic']['rng'] = critic_init_rng
@@ -3405,38 +3137,35 @@ class OGPOAgent(flax.struct.PyTreeNode):
             actor_variables = actor_net_def.init(actor_rng, **actor_args)
             critic_variables = critic_net_def.init(critic_rng, **critic_args)
 
-            # Separate trainable params from non-trainable batch_stats
+            # Separate trainable params from batch_stats (pop handles cases without RSNorm).
             actor_params = actor_variables.pop('params')
-            actor_batch_stats = actor_variables.pop('batch_stats', None) # Use.pop to handle cases without RSNorm
+            actor_batch_stats = actor_variables.pop('batch_stats', None)
             critic_params = critic_variables.pop('params')
             critic_batch_stats = critic_variables.pop('batch_stats', None)
 
-            # Create train states, now including the batch_stats
             actor_state = TrainState.create(
-                apply_fn=actor_net_def.apply, # Ensure apply_fn is passed
-                params=actor_params, 
+                apply_fn=actor_net_def.apply,
+                params=actor_params,
                 tx=actor_tx,
-                batch_stats=actor_batch_stats # Store the stats here
+                batch_stats=actor_batch_stats
             )
             critic_state = TrainState.create(
-                apply_fn=critic_net_def.apply, # Ensure apply_fn is passed
-                params=critic_params, 
+                apply_fn=critic_net_def.apply,
+                params=critic_params,
                 tx=critic_tx,
-                batch_stats=critic_batch_stats # And here
+                batch_stats=critic_batch_stats
             )
         else:
             actor_params = actor_net_def.init(actor_rng, **actor_args)['params']
             critic_params = critic_net_def.init(critic_rng, **critic_args)['params']
 
-            # Replace actor optimizer with encoder-aware version (needs param tree)
             if _has_trainable_encoder:
                 raise NotImplementedError("Encoder-aware optimizer not available on this branch")
 
-            # Create separate train states
             actor_state = TrainState.create(actor_net_def, actor_params, actor_tx)
             critic_state = TrainState.create(critic_net_def, critic_params, critic_tx)
-        
-        # Initialize target networks
+
+        # Initialize target networks.
         actor_params = actor_state.params
         actor_params['modules_target_actor'] = actor_params['modules_actor']
         if not config.use_constant_noise:
@@ -3447,7 +3176,7 @@ class OGPOAgent(flax.struct.PyTreeNode):
         if config.get('use_value_fn', False):
             params['modules_target_value'] = params['modules_value']
 
-        # Initialize one-step policy (optional, for FQL)
+        # Optional FQL one-step policy.
         one_step_state = None
         if config.get('use_one_step_policy', False):
             print("[One-Step Policy] Initializing for FQL distillation")
@@ -3460,14 +3189,13 @@ class OGPOAgent(flax.struct.PyTreeNode):
             one_step_nets = {'one_step': one_step_def, 'target_one_step': copy.deepcopy(one_step_def)}
             one_step_net_def = ModuleDict(one_step_nets)
 
-            # Initialize with (observations, noise)
             ex_noise = jax.random.normal(init_rng, (1, full_act_dim))
             one_step_init_kw = dict(observations=ex_observations, noise=ex_noise, is_encoded=False)
             if config.actor_obs == 'image' and ex_images is not None:
                 one_step_init_kw['images'] = ex_images
             one_step_args = {'one_step': one_step_init_kw, 'target_one_step': one_step_init_kw}
 
-            # Create optimizer for one-step policy (use actor config as defaults)
+            # One-step optimizer defaults to the actor's config.
             one_step_lr = float(config.get('one_step_lr') or config['actor_lr'])
             one_step_scheduler = config.get('one_step_scheduler') or config.actor_scheduler
             one_step_warmup = int(config.get('one_step_warmup_steps') or config.actor_warmup_steps)
@@ -3491,10 +3219,8 @@ class OGPOAgent(flax.struct.PyTreeNode):
             one_step_params = one_step_net_def.init(one_step_rng, **one_step_args)['params']
             one_step_state = TrainState.create(one_step_net_def, one_step_params, one_step_tx)
 
-            # Initialize target
             one_step_state.params['modules_target_one_step'] = one_step_state.params['modules_one_step']
 
-        # store dims
         config.ob_dims = ob_dims
         config.action_dim = action_dim
         return cls(rng, actor_state, critic_state, config, one_step_network=one_step_state)

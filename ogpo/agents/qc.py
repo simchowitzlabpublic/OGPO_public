@@ -28,31 +28,25 @@ from ogpo.agents.modules.pg_helper import (
 )
 
 class ACFQLAgent(flax.struct.PyTreeNode):
-    """Flow Q-learning (FQL) agent with action chunking.
-    The actor is shared between all Q function of different chunk lengths.
-    The actor always predicts action chunks, and is shared between all Q functions.
-    There are chunked critics and non-chunked critics.
-    """
+    """Flow Q-learning (FQL/QC) agent with action chunking."""
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
     def critic_loss(self, batch, grad_params, rng):
-        """Compute the FQL critic loss using q_helper functions."""
+        """Compute the FQL critic (TD) loss."""
         if self.config["action_chunking"]:
             batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
         else:
             batch_actions = batch["actions"][..., 0, :]
 
-        # Sample next actions
         rng, sample_rng = jax.random.split(rng)
         if self.config.best_of_n > 1:
             next_actions = self.sample_actions_BON(batch['next_observations'], rng=sample_rng)
         else:
             next_actions = self.sample_actions(batch['next_observations'], rng=sample_rng)
 
-        # Get next Q-values and aggregate
         next_qs = self.network.select('target_critic')(batch['next_observations'], actions=next_actions)
         rng, agg_rng = jax.random.split(rng)
         next_q = aggregate_q_values(
@@ -62,7 +56,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             num_qs=self.config['num_qs'],
         )
 
-        # Compute TD target
         target_q = compute_td_target(
             rewards=batch['rewards'],
             masks=batch['masks'],
@@ -71,7 +64,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             horizon_length=self.config['horizon_length'],
         )
 
-        # Compute TD loss (MSE or HLGauss)
         if self.config["critic_loss_type"] == "hlgauss":
             q, q_logits = self.network.select('critic')(
                 batch['observations'], actions=batch_actions, params=grad_params, return_logits=True
@@ -129,15 +121,10 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         return bc_loss
 
     def actor_loss(self, batch, grad_params, rng, is_bc_loss=False):
-        """Compute the FQL actor loss.
-
-        Combines BC flow loss with optional distillation and Q losses.
-        Uses bc_helper for standard flow matching BC loss computation.
-        """
+        """Compute the FQL actor loss: BC flow loss plus optional distillation and Q losses."""
         batch_actions = preprocess_actions(batch, self.config["action_chunking"])
         batch_size, action_dim = batch_actions.shape
 
-        # BC flow loss using bc_helper
         rng, targets_rng = jax.random.split(rng)
         x_t, vel, t = get_flow_targets(batch['observations'], batch_actions, targets_rng)
 
@@ -151,14 +138,13 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         )
 
         if self.config["actor_type"] == "distill-ddpg":
-            # Distillation loss.
             rng, noise_rng = jax.random.split(rng)
             noises = jax.random.normal(noise_rng, (batch_size, action_dim))
             target_flow_actions = self.compute_flow_actions(batch['observations'], noises=noises)
             actor_actions = self.network.select('actor_onestep_flow')(batch['observations'], noises, params=grad_params)
             distill_loss = jnp.mean((actor_actions - target_flow_actions) ** 2)
 
-            # Q loss with optional normalization (FQL).
+            # Q loss with optional normalization.
             actor_actions = jnp.clip(actor_actions, -1, 1)
 
             qs = self.network.select(f'critic')(batch['observations'], actions=actor_actions)
@@ -168,9 +154,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
                 lam = jax.lax.stop_gradient(1.0 / jnp.maximum(jnp.abs(q).mean(), 1e-8))
                 q_loss = lam * q_loss
         elif self.config["actor_type"] == "best-of-n":
-            # In best-of-n mode, actor trains with pure BC only.
-            # Q-function guides action selection at inference time, not actor training.
-            # (BoN-SFT, if desired, can be toggled via bon_sft config flag.)
+            # Actor trains with BC only; the Q-function guides selection at inference time.
+            # Optional BoN-SFT distills the best-of-N action back into the actor.
             if self.config.get('bon_sft', False):
                 rng, bon_rng = jax.random.split(rng)
                 best_actions = jax.lax.stop_gradient(
@@ -192,7 +177,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             distill_loss = jnp.zeros(())
             q_loss = jnp.zeros(())
 
-        # Total loss.
         if is_bc_loss:
             actor_loss = bc_flow_loss
         else:
@@ -256,11 +240,10 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def bc_update(self, batch):
-        """BC update: trains flow policy (BC loss) + critic (TD loss).
+        """BC update: trains the flow policy (BC loss) and critic (TD loss).
 
-        Matches the reference QC which uses total_loss for both phases.
-        The critic must be trained during BC so Q-values are meaningful
-        when online RL starts (BoN selection depends on critic quality).
+        The critic is trained during BC so Q-values are meaningful when online
+        RL starts, since BoN selection depends on critic quality.
         """
         new_rng, rng = jax.random.split(self.rng)
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
@@ -279,9 +262,8 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     @jax.jit
     def batch_update(self, batch, batch_success, success_flag):
         """Update the agent and return a new agent with information dictionary."""
-        # update_size = batch["observations"].shape[0]
         batch_tuple = (batch, batch_success)
-        
+
         def scan_fn(agent, batch_tuple):
             return self._update(agent, batch_tuple, success_flag)
 
@@ -309,7 +291,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             noises = jax.random.normal(
                 rng,
                 (
-                    *observations.shape[: -len(self.config['ob_dims'])],  # batch_size
+                    *observations.shape[: -len(self.config['ob_dims'])],
                     self.config['action_dim'] * \
                         (self.config['horizon_length'] if self.config["action_chunking"] else 1),
                 ),
@@ -351,7 +333,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
     @jax.jit
     def sample_actions_BON(self, observations, rng=None):
-        """Fully vectorized Best-of-N action selection for QC."""
+        """Vectorized best-of-N action selection."""
         expected_single_ndim = 3 if self.config['encoder'] else 1
         is_single_obs = observations.ndim == expected_single_ndim
         if is_single_obs:
@@ -362,20 +344,16 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         action_dim = self.config['action_dim'] * \
                      (self.config['horizon_length'] if self.config['action_chunking'] else 1)
 
-        # 1. Sample all B*N noises and expand observations
         rng, noise_key = jax.random.split(rng)
         noises = jax.random.normal(noise_key, (batch_size * num_samples, action_dim))
         obs_expanded = jnp.repeat(observations, num_samples, axis=0)  # [B*N, obs_dim]
 
-        # 2. Run flow on all candidates in one pass
         actions = self.compute_flow_actions(obs_expanded, noises)
         actions = jnp.clip(actions, -1, 1)
 
-        # 3. Evaluate Q-ensemble: (num_qs, B*N) → (num_qs, B, N)
-        q_s = self.network.select("critic")(obs_expanded, actions)
+        q_s = self.network.select("critic")(obs_expanded, actions)  # (num_qs, B*N)
         q_values = q_s.reshape(self.config['num_qs'], batch_size, num_samples)
 
-        # 4. Aggregate Q-ensemble per candidate (respects q_agg setting)
         if self.config['subsample_bon']:
             rng, sub_key = jax.random.split(rng)
             idxs = jax.random.randint(sub_key, (2, batch_size, num_samples), 0, self.config['num_qs'])
@@ -386,7 +364,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         else:
             min_qs = jnp.min(q_values, axis=0)
 
-        # 5. Select best candidate per observation
         best_idx = jnp.argmax(min_qs, axis=1)
         actions_reshaped = actions.reshape(batch_size, num_samples, -1)
         best_actions = jax.vmap(lambda a, i: a[i])(actions_reshaped, best_idx)
@@ -398,10 +375,9 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         self,
         observations,
         noises=None,
-        rng=None,  # Accept rng for compatibility with evaluation code, but use noises instead
+        rng=None,  # accepted for eval-code compatibility; noises are used instead
     ):
-        """Compute actions from the BC flow model using pg_helper ODE function."""
-        # Handle unbatched observations (e.g., from evaluation code)
+        """Compute actions from the BC flow model via ODE integration."""
         add_batch_dim = False
         if (self.config['encoder'] is not None and observations.ndim == 3) or \
            (self.config['encoder'] is None and observations.ndim == 1):
@@ -412,11 +388,9 @@ class ACFQLAgent(flax.struct.PyTreeNode):
 
         act_dim = self.config['action_dim'] * (self.config['horizon_length'] if self.config['action_chunking'] else 1)
 
-        # Handle encoder
         if self.config['encoder'] is not None:
             observations = self.network.select('actor_bc_flow_encoder')(observations)
 
-        # Create wrapper function for actor network
         def actor_fn(obs, actions, t, is_encoded=True):
             return self.network.select('actor_bc_flow')(obs, actions, t, is_encoded=is_encoded)
 
@@ -428,12 +402,11 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             act_dim=act_dim,
             act_min=-1.0,
             act_max=1.0,
-            clip_intermediate=False,  # QC doesn't clip intermediate actions
+            clip_intermediate=False,
             noises=noises,
             is_encoded=True,
         )
 
-        # Remove batch dimension if it was added
         if add_batch_dim:
             actions = actions[0]
 
@@ -477,14 +450,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         ex_actions,
         config,
     ):
-        """Create a new agent.
-
-        Args:
-            seed: Random seed.
-            ex_observations: Example batch of observations.
-            ex_actions: Example batch of actions.
-            config: Configuration dictionary.
-        """
+        """Create a new agent from example observations/actions and a config."""
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -497,7 +463,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             full_actions = ex_actions
         full_action_dim = full_actions.shape[-1]
 
-        # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
@@ -505,11 +470,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             encoders['actor_bc_flow'] = encoder_module()
             encoders['actor_onestep_flow'] = encoder_module()
 
-        # if config["critic_loss_type"] == 'hlgauss':
-        #     config['q_min'] = -3.0 / (1 - config['discount'])
-        #     config['q_max'] = 0.0 / (1 - config['discount'])
-
-        # Two-tier obs encoder (frozen-encoder image runs): see TwoTierObsEncoder.
+        # Two-tier obs encoder so proprio isn't drowned out by high-dim image features.
         _two_tier_kwargs = dict(
             obs_two_tier=config.get('obs_two_tier', False),
             two_tier_img_dim=config.get('_two_tier_img_dim', 0),
@@ -517,12 +478,11 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             two_tier_fused_dim=config.get('two_tier_fused_dim', 0),
         )
 
-        # Define networks.
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             num_ensembles=config['num_qs'],
-            encoder=encoders.get('critic'),  # Keep .get() - encoder may be None
+            encoder=encoders.get('critic'),  # may be None
             critic_loss_type=config['critic_loss_type'],
             num_bins=config['num_bins'],
             q_min=config['q_min'],
@@ -530,7 +490,6 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             **_two_tier_kwargs,
         )
 
-        # Time embedding
         time_emb_type = config.get('time_embedding', 'scalar')
         time_emb_module = None
         if time_emb_type == 'sinusoidal':
@@ -561,7 +520,7 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             target_critic=(copy.deepcopy(critic_def), (ex_observations, full_actions)),
         )
         if encoders.get('actor_bc_flow') is not None:
-            # Add actor_bc_flow_encoder to ModuleDict to make it separately callable.
+            # Register the encoder separately so it can be called on its own.
             network_info['actor_bc_flow_encoder'] = (encoders.get('actor_bc_flow'), (ex_observations,))
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}

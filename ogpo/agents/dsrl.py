@@ -28,9 +28,10 @@ from ogpo.agents.modules.pg_helper import (
 )
 
 class DSRLBestOfNAgent(flax.struct.PyTreeNode):
-    """SAC noise agent + frozen BC flow matching.
-    Critic operates in noise space. Actor outputs noise in [-am, am].
-    Matching the reference DSRL implementation (no noise_critic).
+    """DSRL: SAC noise actor over a frozen BC flow policy.
+
+    The critic and actor operate in noise space; the actor outputs noise in
+    [-action_magnitude, action_magnitude] which the flow policy maps to actions.
     """
 
     rng: Any
@@ -396,9 +397,8 @@ class DSRLBestOfNAgent(flax.struct.PyTreeNode):
             encoders['actor'] = encoder_module()
             encoders['actor_bc_flow'] = encoder_module()
 
-        # Two-tier obs encoder (frozen-encoder image runs): splits the encoded
-        # [image_features, proprio] obs back into image/proprio towers so
-        # proprio isn't buried in a 2048+9D flat MLP. Matches the OGPO setup.
+        # Two-tier obs encoder: splits encoded [image_features, proprio] obs into
+        # separate towers so proprio isn't buried in a high-dim flat MLP.
         _two_tier_kwargs = dict(
             obs_two_tier=config.get('obs_two_tier', False),
             two_tier_img_dim=config.get('_two_tier_img_dim', 0),

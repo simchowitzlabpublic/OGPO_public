@@ -1,15 +1,4 @@
-"""Critic/Value network architectures for OGPO.
-
-This module contains various critic (Q-function/value function) network implementations:
-- Value: Standard MLP-based critic with optional FiLM conditioning
-- ValueTF: Transformer-based critic for sequential action chunks
-- ValueSimBa: SimBa architecture-based critic
-
-All critics support:
-- Ensemble learning (multiple Q-functions)
-- Distributional RL (HL-Gauss loss)
-- Optional encoder integration
-"""
+"""Critic (Q-function / value) network architectures with ensemble and HL-Gauss distributional support."""
 
 from typing import Optional, Sequence
 
@@ -47,26 +36,7 @@ def ensemblize(cls, num_qs, in_axes=None, out_axes=0, **kwargs):
 
 
 class Value(nn.Module):
-    """Standard MLP-based critic network.
-
-    Supports:
-    - Standard MLP or FiLM-conditioned architecture
-    - Ensemble of Q-functions
-    - MSE or HL-Gauss distributional critic
-    - Optional encoder for observations
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions
-        layer_norm: Whether to use layer normalization
-        num_ensembles: Number of ensemble members (default: 2)
-        encoder: Optional encoder module for observations
-        critic_loss_type: 'mse' or 'hlgauss' for distributional critic
-        num_bins: Number of bins for HL-Gauss critic
-        q_min: Minimum Q-value for HL-Gauss
-        q_max: Maximum Q-value for HL-Gauss
-        action_repeat: Whether to use MLPCond for action repetition
-        use_film: Whether to use FiLM conditioning
-    """
+    """MLP critic with optional FiLM conditioning, ensembling, and HL-Gauss distributional output."""
     hidden_dims: Sequence[int]
     layer_norm: bool = True
     num_ensembles: int = 2
@@ -101,7 +71,7 @@ class Value(nn.Module):
 
         if self.num_ensembles > 1:
             if self.use_film:
-                # For FiLM, ensemblize with two inputs (x, cond)
+                # FiLM takes two inputs (x, cond)
                 mlp_class = ensemblize(mlp_class, self.num_ensembles, in_axes=(None, None), out_axes=0)
             else:
                 mlp_class = ensemblize(mlp_class, self.num_ensembles)
@@ -122,22 +92,10 @@ class Value(nn.Module):
         return self.encoder(observations)
 
     def __call__(self, observations, actions=None, return_logits=False, is_encoded=False, images=None):
-        """Forward pass through the critic.
-
-        Args:
-            observations: State observations
-            actions: Actions (required for FiLM or action_repeat mode)
-            return_logits: Whether to return logits for HL-Gauss critic
-            is_encoded: Whether observations are already encoded
-            images: Optional image observations for VisionProprioEncoder
-
-        Returns:
-            Q-values, optionally with logits for distributional critic
-        """
+        """Forward pass returning Q-values, optionally with HL-Gauss logits."""
         if self.encoder is not None and not is_encoded:
             observations = self.encode(observations, images)
 
-        # Two-tier obs encoder for frozen image features (L2-norm + dual-tower fusion).
         if self.obs_two_tier:
             observations = self.two_tier_encoder(observations)
 
@@ -156,7 +114,6 @@ class Value(nn.Module):
             else:
                 v = self.value_net(actions, observations).squeeze(-1)
         else:
-            # Standard MLP path
             inputs = [observations]
             if actions is not None and not self.action_repeat:
                 inputs.append(actions)
@@ -186,28 +143,7 @@ class Value(nn.Module):
 
 
 class ValueTF(nn.Module):
-    """Transformer critic for sequential action chunks.
-
-    Matches the original sbp_spl codebase architecture:
-    - Single Dense layer for conditioning projection (not ConditioningMLP)
-    - No positional embeddings for action tokens
-    - No causal masking (fully bidirectional self-attention)
-
-    Attributes:
-        hidden_dim: Hidden dimension (must be divisible by num_heads)
-        action_dim: Action dimension
-        action_chunk_size: Number of action steps in sequence
-        layer_norm: Whether to use layer normalization
-        num_ensembles: Number of ensemble members
-        encoder: Optional encoder for observations
-        critic_loss_type: 'mse' or 'hlgauss'
-        num_bins: Number of bins for HL-Gauss
-        q_min: Minimum Q-value for HL-Gauss
-        q_max: Maximum Q-value for HL-Gauss
-        num_layers: Number of transformer layers
-        num_heads: Number of attention heads
-        dropout_rate: Dropout rate
-    """
+    """Transformer critic over sequential action chunks (bidirectional self-attention, no positional embeddings)."""
     hidden_dim: int
     action_dim: int
     action_chunk_size: int = 1
@@ -248,7 +184,7 @@ class ValueTF(nn.Module):
                             self.dropout_rate
                         )(x, cond, deterministic=deterministic)
                 else:  # cross_attn
-                    # Critic only has state conditioning (no time), wrap as (B, 1, D)
+                    # state-only conditioning wrapped as a single context token (B, 1, D)
                     context = cond[:, None, :]
                     for _ in range(self.num_layers):
                         x = CrossAttnLayer(
@@ -300,21 +236,7 @@ class ValueTF(nn.Module):
 
 
 class ValueSimBa(nn.Module):
-    """Critic using SimBa (Simple Baseline) architecture.
-
-    SimBa uses running statistics normalization for improved stability.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions
-        num_ensembles: Number of ensemble members
-        encoder: Optional encoder for observations
-        critic_loss_type: 'mse' or 'hlgauss'
-        num_bins: Number of bins for HL-Gauss
-        q_min: Minimum Q-value for HL-Gauss
-        q_max: Maximum Q-value for HL-Gauss
-        rs_norm_momentum: Momentum for running statistics normalization
-        rs_norm_epsilon: Epsilon for running statistics normalization
-    """
+    """Critic using the SimBa architecture (residual blocks + running-stat normalization)."""
     hidden_dims: Sequence[int]
     num_ensembles: int = 2
     encoder: Optional[nn.Module] = None
@@ -328,13 +250,10 @@ class ValueSimBa(nn.Module):
     def setup(self):
         num_output = self.num_bins if self.critic_loss_type == "hlgauss" else 1
 
-        # Create single or ensemble of SimBa MLPs
         mlp_class = SimBaMLP
-
         if self.num_ensembles > 1:
             mlp_class = ensemblize(mlp_class, self.num_ensembles)
 
-        # Create the value network(s)
         self.value_net = mlp_class(
             hidden_dims=(*self.hidden_dims, num_output),
             rs_norm_momentum=self.rs_norm_momentum,
@@ -351,23 +270,10 @@ class ValueSimBa(nn.Module):
 
     def __call__(self, observations, actions=None, return_logits=False,
                  is_encoded=False, images=None):
-        """Forward pass through the SimBa critic.
-
-        Args:
-            observations: State observations
-            actions: Actions (optional, will be concatenated with observations)
-            return_logits: Whether to return logits for HL-Gauss critic
-            is_encoded: Whether observations are already encoded
-            images: Optional image observations for VisionProprioEncoder
-
-        Returns:
-            Q-values, optionally with logits for distributional critic
-        """
-        # Encode observations if needed
+        """Forward pass returning Q-values, optionally with HL-Gauss logits."""
         if not is_encoded and self.encoder is not None:
             observations = self.encode(observations, images)
 
-        # Prepare inputs
         inputs = [observations]
         if actions is not None:
             inputs.append(actions)
@@ -375,10 +281,8 @@ class ValueSimBa(nn.Module):
 
         q_values = self.value_net(x)
 
-        # Handle distributional critic if needed
         if self.critic_loss_type == 'hlgauss':
             if self.num_ensembles > 1:
-                # Process each ensemble member
                 v_list = []
                 for q_logits in q_values:
                     v = jnp.sum(
@@ -406,23 +310,8 @@ class ValueSimBa(nn.Module):
 class ValueMIP(nn.Module):
     """MIP-parameterized Q-function with noise-based implicit ensembles.
 
-    Instead of explicit ensembles (num_qs separate networks), uses a single
-    network conditioned on random scalar noise z ~ Uniform[-u, u] to create diversity.
-
-    Architecture follows MIP actor pattern:
-    - Step 1 (t=0): Initial Q estimate from [obs, action, noise, t]
-    - Step 2 (t=t*): Refined Q estimate from [obs, action, q_0_features, t*]
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions
-        mip_q_noise_scale: Scale for uniform noise sampling (samples from [-u, u])
-        mip_t_star: Time for second step (typically 0.9)
-        layer_norm: Whether to use layer normalization
-        encoder: Optional encoder for observations
-        critic_loss_type: 'mse' or 'hlgauss'
-        num_bins: Number of bins for HL-Gauss
-        q_min: Minimum Q-value for HL-Gauss
-        q_max: Maximum Q-value for HL-Gauss
+    Uses a single network conditioned on random scalar noise z ~ Uniform[-u, u]
+    to create diversity, in place of explicit separate ensemble networks.
     """
     hidden_dims: Sequence[int]
     mip_q_noise_scale: float = 1.0
@@ -435,15 +324,9 @@ class ValueMIP(nn.Module):
     q_max: Optional[float] = None
 
     def setup(self):
-        """Initialize MLP network for both MIP steps.
-
-        Uses single MLP that takes [obs, action, scalar_value, time] and outputs Q-value.
-        The scalar_value is either noise z_0 at t=0, or Q_0 prediction at t=t*.
-        """
+        # Single MLP for both MIP steps: [obs, action, scalar_value, t] -> Q-value,
+        # where scalar_value is noise z_0 at t=0 or the Q_0 prediction at t=t*.
         num_output = self.num_bins if self.critic_loss_type == "hlgauss" else 1
-
-        # Single MLP for both steps (like MIP actor)
-        # Input: [obs, action, scalar_value, t] -> Q-value
         self.mlp = MLP(
             (*self.hidden_dims, num_output),
             activate_final=False,
@@ -469,31 +352,18 @@ class ValueMIP(nn.Module):
         images=None,
         rng=None,
     ):
-        """Forward pass through MIP-Q.
+        """Forward pass returning Q-values.
 
-        Args:
-            observations: State observations [B, obs_dim]
-            actions: Actions [B, act_dim]
-            scalar_input: Scalar input [B, 1]. Either noise z_0 or Q_0 prediction.
-                         If None, samples noise internally.
-            time: Time value [B, 1]. If None, assumes t=0.
-            return_logits: For HL-Gauss, return logits
-            is_encoded: Whether observations are pre-encoded
-            images: Optional images for vision encoder
-            rng: Random key for noise sampling (if scalar_input=None)
-
-        Returns:
-            Q-values [B] or [B, num_bins], optionally with logits
+        scalar_input is either noise z_0 (t=0) or the Q_0 prediction (t=t*); if None,
+        noise is sampled internally from Uniform[-scale, scale] using rng.
         """
-        # Encode observations
         if self.encoder is not None and not is_encoded:
             observations = self.encode(observations, images)
 
-        # Handle both 2D (batch, dim) and 3D (batch, chunk, dim) inputs for action chunking
+        # Supports 2D (batch, dim) and 3D (batch, chunk, dim) action-chunking inputs.
         obs_shape = observations.shape
         batch_size = obs_shape[0]
 
-        # Sample scalar noise if not provided: Uniform[-scale, scale]
         if scalar_input is None:
             if rng is None:
                 raise ValueError("Must provide either scalar_input or rng")
@@ -503,7 +373,6 @@ class ValueMIP(nn.Module):
                 maxval=self.mip_q_noise_scale
             )
 
-        # Default time to 0 if not provided
         if time is None:
             if len(obs_shape) == 3:
                 chunk_size = obs_shape[1]
@@ -511,18 +380,14 @@ class ValueMIP(nn.Module):
             else:
                 time = jnp.zeros((batch_size, 1))
 
-        # Broadcast scalar_input if needed for action chunking
         if len(obs_shape) == 3:
             chunk_size = obs_shape[1]
-            # Broadcast: (batch, 1) -> (batch, chunk, 1)
             if scalar_input.shape[1] == 1:
                 scalar_input = jnp.tile(scalar_input[:, None, :], (1, chunk_size, 1))
 
-        # Forward pass: [obs, action, scalar, time] -> Q
         mlp_input = jnp.concatenate([observations, actions, scalar_input, time], axis=-1)
         q_output = self.mlp(mlp_input)
 
-        # Process output based on loss type
         if self.critic_loss_type == 'hlgauss':
             q_logits = q_output
             q_values = jnp.sum(
@@ -539,30 +404,9 @@ class ValueMIP(nn.Module):
 
 
 class ValueMIPEnsemble(nn.Module):
-    """Explicit ensemble of MIP-Q networks.
+    """Explicit ensemble of MIP-Q networks (separate params, shared noise per call).
 
-    Instead of single network + multiple noises (implicit ensemble via ValueMIP),
-    uses multiple networks + single shared noise (explicit ensemble).
-
-    Each ensemble member is a separate MIP-Q network with independent parameters.
-    All members receive the SAME noise value, creating diversity through network parameters.
-
-    Architecture:
-    - Multiple MIP networks created via vmapping
-    - Step 1 (t=0): Initial Q estimate from [obs, action, shared_noise, t]
-    - Step 2 (t=t*): Refined Q estimate from [obs, action, q_0, t*]
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions
-        num_ensembles: Number of ensemble members (separate MIP networks)
-        mip_q_noise_scale: Scale for uniform noise sampling
-        mip_t_star: Time for second step (typically 0.9)
-        layer_norm: Whether to use layer normalization
-        encoder: Optional encoder for observations
-        critic_loss_type: 'mse' or 'hlgauss'
-        num_bins: Number of bins for HL-Gauss
-        q_min: Minimum Q-value for HL-Gauss
-        q_max: Maximum Q-value for HL-Gauss
+    Diversity comes from independent network parameters rather than per-member noise.
     """
     hidden_dims: Sequence[int]
     num_ensembles: int = 2
@@ -576,22 +420,13 @@ class ValueMIPEnsemble(nn.Module):
     q_max: Optional[float] = None
 
     def setup(self):
-        """Initialize ensemblized MIP MLP.
-
-        Uses vmapping to create num_ensembles copies of the MLP,
-        each with independent parameters.
-        """
         num_output = self.num_bins if self.critic_loss_type == "hlgauss" else 1
 
-        # Create MLP class
         mlp_class = MLP
-
-        # Ensemblize if num_ensembles > 1
-        # Use in_axes=0 to map over the first dimension of concatenated input
+        # in_axes=0 maps over the leading ensemble dimension of the concatenated input.
         if self.num_ensembles > 1:
             mlp_class = ensemblize(mlp_class, self.num_ensembles, in_axes=0, out_axes=0)
 
-        # Create the network (will be vmapped if ensemblized)
         self.mlp = mlp_class(
             (*self.hidden_dims, num_output),
             activate_final=False,
@@ -617,33 +452,18 @@ class ValueMIPEnsemble(nn.Module):
         images=None,
         rng=None,
     ):
-        """Forward pass through MIP-Q ensemble.
+        """Forward pass returning Q-values [num_ensembles, B].
 
-        Args:
-            observations: State observations [B, obs_dim]
-            actions: Actions [B, act_dim]
-            scalar_input: Scalar input [B, 1] or [B, num_ensembles, 1].
-                         - [B, 1]: Same noise shared across all ensemble members (step 1)
-                         - [B, num_ensembles, 1]: Different q_0 for each member (step 2)
-                         If None, samples noise internally.
-            time: Time value [B, 1]. If None, assumes t=0.
-            return_logits: For HL-Gauss, return logits
-            is_encoded: Whether observations are pre-encoded
-            images: Optional images for vision encoder
-            rng: Random key for noise sampling (if scalar_input=None)
-
-        Returns:
-            Q-values [num_ensembles, B] or with logits [num_ensembles, B], [num_ensembles, B, num_bins]
+        scalar_input is [B, 1] (noise shared across members) or [B, num_ensembles, 1]
+        (per-member q_0); if None, noise is sampled internally via rng.
         """
-        # Encode observations
         if self.encoder is not None and not is_encoded:
             observations = self.encode(observations, images)
 
-        # Handle both 2D (batch, dim) and 3D (batch, chunk, dim) inputs for action chunking
+        # Supports 2D (batch, dim) and 3D (batch, chunk, dim) action-chunking inputs.
         obs_shape = observations.shape
         batch_size = obs_shape[0]
 
-        # Sample scalar noise if not provided: Uniform[-scale, scale]
         if scalar_input is None:
             if rng is None:
                 raise ValueError("Must provide either scalar_input or rng")
@@ -653,7 +473,6 @@ class ValueMIPEnsemble(nn.Module):
                 maxval=self.mip_q_noise_scale
             )
 
-        # Default time to 0 if not provided
         if time is None:
             if len(obs_shape) == 3:
                 chunk_size = obs_shape[1]
@@ -661,49 +480,39 @@ class ValueMIPEnsemble(nn.Module):
             else:
                 time = jnp.zeros((batch_size, 1))
 
-        # Broadcast scalar_input if needed for action chunking
         if len(obs_shape) == 3:
             chunk_size = obs_shape[1]
-            # Broadcast: (batch, 1) -> (batch, chunk, 1)
             if scalar_input.ndim == 2 and scalar_input.shape[1] == 1:
                 scalar_input = jnp.tile(scalar_input[:, None, :], (1, chunk_size, 1))
 
-        # Prepare inputs for vmapped MLP (expects in_axes=0)
-        # Need to reshape all inputs to [num_ensembles, B, D] (or [num_ensembles, B, chunk, D])
-
-        # Handle scalar_input: either [B, 1], [B, num_ensembles, 1], or [B, chunk, 1]
+        # Reshape all inputs to [num_ensembles, B, ...] for the vmapped MLP (in_axes=0).
         if scalar_input.ndim == 3:
-            # Check if it's from action chunking [B, chunk, 1] or from ensemble [B, num_ensembles, 1]
             if len(obs_shape) == 3:
-                # Action chunking case: [B, chunk, 1] -> [num_ensembles, B, chunk, 1] (broadcast)
+                # action chunking: [B, chunk, 1] -> [num_ensembles, B, chunk, 1]
                 scalar_input = jnp.tile(scalar_input[None, :, :, :], (self.num_ensembles, 1, 1, 1))
             elif scalar_input.shape[1] == self.num_ensembles:
-                # Step 2 case: [B, num_ensembles, 1] -> [num_ensembles, B, 1]
+                # per-member q_0: [B, num_ensembles, 1] -> [num_ensembles, B, 1]
                 scalar_input = jnp.transpose(scalar_input, (1, 0, 2))
             else:
                 raise ValueError(f"Unexpected scalar_input shape: {scalar_input.shape}")
         elif scalar_input.ndim == 2:
-            # Step 1 case: [B, 1] -> [num_ensembles, B, 1] (broadcast)
+            # shared noise: [B, 1] -> [num_ensembles, B, 1]
             scalar_input = jnp.tile(scalar_input[None, :, :], (self.num_ensembles, 1, 1))
         else:
             raise ValueError(f"scalar_input must be 2D or 3D, got shape: {scalar_input.shape}")
 
-        # Broadcast other inputs to [num_ensembles, B, ...]
-        # Handle both 2D and 3D (action chunking) cases
         if observations.ndim == 2:
             observations = jnp.tile(observations[None, :, :], (self.num_ensembles, 1, 1))
             actions = jnp.tile(actions[None, :, :], (self.num_ensembles, 1, 1))
             time = jnp.tile(time[None, :, :], (self.num_ensembles, 1, 1))
-        else:  # 3D case for action chunking
+        else:
             observations = jnp.tile(observations[None, :, :, :], (self.num_ensembles, 1, 1, 1))
             actions = jnp.tile(actions[None, :, :, :], (self.num_ensembles, 1, 1, 1))
             time = jnp.tile(time[None, :, :, :], (self.num_ensembles, 1, 1, 1))
 
-        # Forward pass: [obs, action, scalar, time] -> Q
         mlp_input = jnp.concatenate([observations, actions, scalar_input, time], axis=-1)
         q_output = self.mlp(mlp_input)  # [num_ensembles, B, num_output]
 
-        # Process output based on loss type
         if self.critic_loss_type == 'hlgauss':
             q_logits = q_output  # [num_ensembles, B, num_bins]
             q_values = jnp.sum(
@@ -719,7 +528,6 @@ class ValueMIPEnsemble(nn.Module):
         return q_values
 
 
-# Export list
 __all__ = [
     'default_init',
     'ensemblize',
