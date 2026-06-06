@@ -44,7 +44,7 @@ ft_flow_steps=10
 time_embedding=sinusoidal       # scalar | sinusoidal
 time_embedding_dim=32
 bc_coeff=1.0
-adv_strategy=vanilla
+adv_strategy=conservative       # this can be vanilla | conservative | awr
 awr_beta=10
 adv_clip_min=null               # set to 0 for "no-negative OGPO" (zero out A<0)
 
@@ -121,7 +121,7 @@ use_constant_noise=false
 use_tapered_noise=true
 # Score correction during SDE sampling (Theorem 17): preserves marginal of BC ODE.
 error_correct_sde_to_ode=true
-constant_noise_std=0.1
+constant_noise_std=0.05
 min_noise_std=0.01
 max_noise_std=0.01
 
